@@ -1,4 +1,3 @@
-import pytest
 from domain.properties import QualityProperty, rubric_for
 
 def test_six_properties():

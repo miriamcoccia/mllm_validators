@@ -1,5 +1,5 @@
 """
-In this file, we define the names of the properties to be used throughout the project
+properties.py: In this file, we define the names of the properties to be used throughout the project
 alongside their definitions.
 """
 from enum import StrEnum

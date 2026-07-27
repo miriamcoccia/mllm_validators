@@ -2,12 +2,14 @@
 verdict.py: This file creates a Pydantic schema to handle the format of the model's response.
 """
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, ConfigDict, model_validator
 from typing_extensions import Self
 from domain.properties import QualityProperty
 from domain.errors import VerdictError
 
 class Verdict(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     property: QualityProperty
     passed: bool
     reasoning: str
