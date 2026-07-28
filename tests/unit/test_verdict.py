@@ -1,5 +1,5 @@
 """
-test_verdict.py: tests for the Verdict dataclass. 
+test_verdict.py: tests for the Verdict dataclass.
 """
 
 import pytest
@@ -7,6 +7,7 @@ from domain.verdict import Verdict
 from domain.properties import QualityProperty
 from domain.errors import VerdictError
 from pydantic import ValidationError
+
 
 # builds a valid verdict to be overridden with the data we are testing
 def make_verdict(**overrides):
@@ -21,6 +22,7 @@ def make_verdict(**overrides):
     defaults.update(overrides)
     return Verdict(**defaults)
 
+
 # happy path: valid verdict builds
 def test_valid_verdict_builds():
     """
@@ -31,6 +33,7 @@ def test_valid_verdict_builds():
     assert verdict.passed == True
     assert verdict.reasoning == ""
 
+
 # immutability
 def test_verdict_is_frozen():
     """
@@ -40,13 +43,15 @@ def test_verdict_is_frozen():
     with pytest.raises(ValidationError):
         verdict.passed = False
 
+
 # sad path: invalid without explanation
 def test_not_passed_needs_reasoning():
     """
     Quality properties that did not pass should always have a reasoninig. Empty strings in the reasoning field should fail.
-    """ 
+    """
     with pytest.raises(VerdictError):
         make_verdict(passed=False, reasoning="")
+
 
 def test_passed_has_no_reasoning():
     """

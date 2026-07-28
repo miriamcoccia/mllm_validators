@@ -1,5 +1,6 @@
 from domain.properties import QualityProperty, rubric_for
 
+
 def test_six_properties():
     """
     The number of properties must be exactly 6
