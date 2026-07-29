@@ -1,0 +1,42 @@
+"""
+technical_quality.py: mutations that damage an image's resolution, contrast,
+or legibility — testing whether the model detects poor technical quality.
+"""
+
+from PIL import Image, ImageFilter
+from pathlib import Path
+
+from mutations.base import Mutation, MutatedItem, MutationType, Severity
+from domain.item import Item
+
+
+class BlurMutation:
+    RADIUS_BY_SEVERITY = {
+        Severity.SUBTLE: 2,
+        Severity.MODERATE: 6,
+        Severity.OBVIOUS: 15,
+    }
+
+    def name(self) -> str:
+        return "blur"
+
+    def apply(self, item: Item, severity: Severity) -> MutatedItem:
+        original_path = Path(item.image)
+        original_image = Image.open(original_path)
+
+        blurred_image = original_image.filter(
+            ImageFilter.GaussianBlur(self.RADIUS_BY_SEVERITY[severity])
+        )
+
+        new_filename = (
+            f"{original_path.stem}_blur_{severity.value}{original_path.suffix}"
+        )
+        new_path = original_path.parent / new_filename
+        blurred_image.save(new_path)
+
+        return MutatedItem(
+            original=item,
+            mutation_type=MutationType.TECHNICAL_QUALITY,
+            severity=severity,
+            mutated_image=str(new_path),
+        )
