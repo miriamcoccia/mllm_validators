@@ -20,7 +20,7 @@ class BlurMutation:
     def name(self) -> str:
         return "blur"
 
-    def apply(self, item: Item, severity: Severity) -> MutatedItem:
+    def apply(self, item: Item, severity: Severity, seed: int) -> MutatedItem:
         original_path = Path(item.image)
         original_image = Image.open(original_path)
 

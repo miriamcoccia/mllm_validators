@@ -1,0 +1,59 @@
+"""
+visual_clarity.py: mutations that add visual clutter — random shapes —
+testing whether the model detects reduced visual clarity.
+"""
+
+import random
+from pathlib import Path
+from PIL import Image, ImageDraw
+
+from domain.item import Item
+from mutations.base import MutatedItem, MutationType, Severity
+
+
+class ClarityMutation:
+    SHAPE_COUNT_BY_SEVERITY = {
+        Severity.SUBTLE: 2,
+        Severity.MODERATE: 5,
+        Severity.OBVIOUS: 10,
+    }
+    SHAPE_SIZE_FRACTION_BY_SEVERITY = {
+        Severity.SUBTLE: 0.05,
+        Severity.MODERATE: 0.10,
+        Severity.OBVIOUS: 0.20,
+    }
+
+    def name(self) -> str:
+        return "clarity_shapes"
+
+    def apply(self, item: Item, severity: Severity, seed: int) -> MutatedItem:
+        # 1. open original image, make a copy
+        original_path = Path(item.image)
+        original_image = Image.open(original_path)
+        copied_image = original_image.copy()
+        draw = ImageDraw.Draw(copied_image)
+        rng = random.Random(seed)
+
+        width, height = copied_image.size
+        fraction = self.SHAPE_SIZE_FRACTION_BY_SEVERITY[severity]
+        shape_size = int(width * fraction)
+        shape_count = self.SHAPE_COUNT_BY_SEVERITY[severity]
+
+        for _ in range(shape_count):
+            # box boundaries
+            # top_corners
+            x = rng.randint(0, width - shape_size)
+            y = rng.randint(0, height - shape_size)
+            color = (rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255))
+            draw.ellipse([x, y, x + shape_size, y + shape_size], fill=color)
+
+        new_filename = f"{original_path.stem}_clarity_shapes_{severity.value}{original_path.suffix}"
+        new_path = original_path.parent / new_filename
+        copied_image.save(new_path)
+
+        return MutatedItem(
+            original=item,
+            mutation_type=MutationType.VISUAL_CLARITY,
+            severity=severity,
+            mutated_image=str(new_path),
+        )
