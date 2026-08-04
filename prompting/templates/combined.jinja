@@ -1,0 +1,12 @@
+Given the CHARACTERISTICS below and the QUESTION, evaluate whether the QUESTION complies with each of the following LIST_OF_CONDITIONS.
+
+CHARACTERISTICS: {{ characteristics }}
+
+QUESTION: {{ question }}
+
+LIST_OF_CONDITIONS:
+{% for prop in properties %}
+- {{ prop.name }}: {{ prop.definition }}
+{% endfor %}
+
+For each condition, respond with the property name, whether it passed, and (only if it did not pass) a brief reasoning.
