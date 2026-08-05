@@ -7,6 +7,7 @@ from typing_extensions import Self
 from domain.properties import QualityProperty
 from domain.errors import VerdictError
 
+
 class Verdict(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -20,7 +21,11 @@ class Verdict(BaseModel):
         The reasoning should only be provided if the verdict returns passed=False.
         """
         if self.passed and len(self.reasoning) > 0:
-            raise VerdictError("The reasoning should only be provided if a trait did not pass.")
+            raise VerdictError(
+                "The reasoning should only be provided if a trait did not pass."
+            )
         if not self.passed and len(self.reasoning) == 0:
-            raise VerdictError("The reasoning can't be empty if the trait did not pass.")
+            raise VerdictError(
+                "The reasoning can't be empty if the trait did not pass."
+            )
         return self

@@ -1,10 +1,10 @@
-GPT54:
-  input_per_million: 2.5
-  output_per_million: 15.0
+GPT56Luna:
+  input_per_million: 0.2
+  output_per_million: 1.2
 
-GPT55: 
-  input_per_million: 5.0
-  output_per_million: 30.0
+GPT56Terra:
+  input_per_million: 2.0
+  output_per_million: 12
 
 KimiK26:  
   input_per_million: 0.95
