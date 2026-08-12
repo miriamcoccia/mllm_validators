@@ -6,7 +6,7 @@ from pathlib import Path
 from PIL import Image
 
 from domain.item import Item
-from mutations.base import MutatedItem, MutationType, Severity
+from mutations.base import MutatedItem, MutationType, Severity, build_mutated_path
 
 
 class RotateMutation:
@@ -27,10 +27,9 @@ class RotateMutation:
             self.ANGLE_BY_SEVERITY[severity], expand=True
         )
 
-        new_filename = (
-            f"{original_path.stem}_rotated_{severity.value}{original_path.suffix}"
+        new_path = build_mutated_path(
+            item.id, self.name(), severity, original_path.suffix
         )
-        new_path = original_path.parent / new_filename
         rotated_image.save(new_path)
 
         return MutatedItem(

@@ -6,6 +6,21 @@ from enum import StrEnum
 from domain.item import Item
 from dataclasses import dataclass
 from typing import Protocol
+from pathlib import Path
+
+MUTATED_DIR = Path("data/mutated")
+
+
+def build_mutated_path(
+    item_id: str, mutation_name: str, severity: Severity, suffix: str
+) -> Path:
+    """
+    Builds the standard output path for a mutated image:
+    data/mutated/{item_id}/{mutation_name}_{severity}{suffix}
+    """
+    item_dir = MUTATED_DIR / item_id
+    item_dir.mkdir(parents=True, exist_ok=True)
+    return item_dir / f"{mutation_name}_{severity.value}{suffix}"
 
 
 class Severity(StrEnum):

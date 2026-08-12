@@ -4,12 +4,13 @@ registry.py: maps provider names to their classes
 
 from providers.base import BatchProvider
 from providers.openai_provider import OpenAIProvider
+from providers.nebius_provider import NebiusProvider
 
 # from providers.nebius_provider import NebiusProvider
 
 PROVIDERS: dict[str, type] = {
     "openai": OpenAIProvider,
-    #    "nebius": NebiusProvider,
+    "nebius": NebiusProvider,
 }
 
 

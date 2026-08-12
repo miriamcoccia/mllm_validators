@@ -8,7 +8,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 from domain.item import Item
-from mutations.base import MutatedItem, MutationType, Severity
+from mutations.base import MutatedItem, MutationType, Severity, build_mutated_path
 
 
 class ClarityMutation:
@@ -47,8 +47,9 @@ class ClarityMutation:
             color = (rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255))
             draw.ellipse([x, y, x + shape_size, y + shape_size], fill=color)
 
-        new_filename = f"{original_path.stem}_clarity_shapes_{severity.value}{original_path.suffix}"
-        new_path = original_path.parent / new_filename
+            new_path = build_mutated_path(
+                item.id, self.name(), severity, original_path.suffix
+            )
         copied_image.save(new_path)
 
         return MutatedItem(

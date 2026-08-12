@@ -7,7 +7,7 @@ from pathlib import Path
 
 from domain.item import Item
 from PIL import Image
-from mutations.base import MutatedItem, MutationType, Severity
+from mutations.base import MutatedItem, MutationType, Severity, build_mutated_path
 
 
 class FunctionalRelevanceMutation:
@@ -20,9 +20,6 @@ class FunctionalRelevanceMutation:
     def apply(self, item: Item, severity: Severity, seed: int) -> MutatedItem:
         # TODO: apply severity, so that the more severe substitutions are taken from different subjects
         original_path = Path(item.image)
-        new_filename = (
-            f"{original_path.stem}_funct_relevance_substitute{original_path.suffix}"
-        )
 
         rng = random.Random(seed)
         possible_substitutes = [
@@ -31,7 +28,9 @@ class FunctionalRelevanceMutation:
         substitute = rng.choice(possible_substitutes)
         substitute_path = Path(substitute.image)
         substitute_image = Image.open(substitute_path)
-        new_path = original_path.parent / new_filename
+        new_path = build_mutated_path(
+            item.id, self.name(), severity, original_path.suffix
+        )
         substitute_image.save(new_path)
 
         return MutatedItem(

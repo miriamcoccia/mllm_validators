@@ -9,7 +9,7 @@ from pathlib import Path
 from PIL import Image
 
 from domain.item import Item
-from mutations.base import MutatedItem, MutationType, Severity
+from mutations.base import MutatedItem, MutationType, Severity, build_mutated_path
 
 
 class TextImageCoherenceMutation:
@@ -21,9 +21,6 @@ class TextImageCoherenceMutation:
 
     def apply(self, item: Item, severity: Severity, seed: int) -> MutatedItem:
         original_path = Path(item.image)
-        new_filename = (
-            f"{original_path.stem}_coherence_substitute{original_path.suffix}"
-        )
 
         rng = random.Random(seed)
         possible_substitutes = [
@@ -36,7 +33,9 @@ class TextImageCoherenceMutation:
         substitute = rng.choice(possible_substitutes)
         substitute_path = Path(substitute.image)
         substitute_image = Image.open(substitute_path)
-        new_path = original_path.parent / new_filename
+        new_path = build_mutated_path(
+            item.id, self.name(), severity, original_path.suffix
+        )
         substitute_image.save(new_path)
 
         return MutatedItem(
