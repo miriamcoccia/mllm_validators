@@ -16,6 +16,7 @@ class BatchStatus(StrEnum):
 
 @dataclass(frozen=True)
 class RawResponse:
+    custom_id: str
     content: str
     input_tokens: int
     output_tokens: int
@@ -25,6 +26,7 @@ class RawResponse:
 class PromptRequest:
     custom_id: str
     prompt: str
+    endpoint: str
     image_path: str | None = None
 
     def __post_init__(self):

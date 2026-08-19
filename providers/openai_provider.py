@@ -38,7 +38,7 @@ class OpenAIProvider:
             "method": "POST",
             "url": "/v1/responses",
             "body": {
-                "model": "gpt-5.6-luna",  # placeholder for now
+                "model": request.endpoint,  # placeholder for now
                 "input": [{"role": "user", "content": content}],
             },
         }
@@ -46,7 +46,11 @@ class OpenAIProvider:
     def submit_batch(self, requests: list[PromptRequest]) -> str:
         BATCH_DIR.mkdir(parents=True, exist_ok=True)
 
-        lines = [self._build_batch_line(r) for r in requests]
+        lines = []
+        for i, request in enumerate(requests):
+            lines.append(self._build_batch_line(request))
+            if (i + 1) % 100 == 0 or (i + 1) == len(requests):
+                print(f"Built {i + 1}/{len(requests)} requests...")
 
         batch_file_path = BATCH_DIR / "batch_input.jsonl"
         with open(batch_file_path, "w") as f:
@@ -84,6 +88,7 @@ class OpenAIProvider:
 
     def _parse_batch_line(self, line: str) -> RawResponse:
         data = json.loads(line)
+        custom_id = data["custom_id"]
         body = data["response"]["body"]
 
         message_block = next(
@@ -93,6 +98,7 @@ class OpenAIProvider:
         usage = body["usage"]
 
         return RawResponse(
+            custom_id=custom_id,
             content=content,
             input_tokens=usage["input_tokens"],
             output_tokens=usage["output_tokens"],

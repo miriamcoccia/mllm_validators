@@ -1,15 +1,15 @@
-GPT56Luna:
+gpt5.6-luna:
   input_per_million: 0.2
   output_per_million: 1.2
 
-GPT56Terra:
+gpt5.6-terra:
   input_per_million: 2.0
   output_per_million: 12
 
-KimiK26:  
+moonshotai/Kimi-K2.6:  
   input_per_million: 0.95
   output_per_million: 4.0
 
-Qwen25-VL-72B-Instruct:
+Qwen/Qwen2.5-VL-72B-Instruct:
   input_per_million: 0.25
   output_per_million: 0.75

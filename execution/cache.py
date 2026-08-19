@@ -19,6 +19,8 @@ class Cache:
         return fingerprint in self.completed
 
     def mark_done(self, fingerprint: str) -> None:
+        if fingerprint in self.completed:
+            return
         self.completed.add(fingerprint)
         with open(self.cache_path, "a") as f:
             f.write(fingerprint + "\n")

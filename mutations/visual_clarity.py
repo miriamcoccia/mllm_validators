@@ -36,7 +36,7 @@ class ClarityMutation:
 
         width, height = copied_image.size
         fraction = self.SHAPE_SIZE_FRACTION_BY_SEVERITY[severity]
-        shape_size = int(width * fraction)
+        shape_size = int(min(width, height) * fraction)
         shape_count = self.SHAPE_COUNT_BY_SEVERITY[severity]
 
         for _ in range(shape_count):

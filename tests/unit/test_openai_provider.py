@@ -10,6 +10,7 @@ from providers.base import PromptRequest
 def test_parse_batch_line():
     fake_line = json.dumps(
         {
+            "custom_id": "fake_fingerprint_123",
             "response": {
                 "body": {
                     "output": [
@@ -18,7 +19,7 @@ def test_parse_batch_line():
                     ],
                     "usage": {"input_tokens": 100, "output_tokens": 20},
                 }
-            }
+            },
         }
     )
 
@@ -35,13 +36,17 @@ def test_build_batch_line_with_image():
     provider._uploaded_files["fake_image.png"] = "file-fake123"
 
     request = PromptRequest(
-        custom_id="q1", prompt="test prompt", image_path="fake_image.png"
+        custom_id="q1",
+        prompt="test prompt",
+        endpoint="fake-endpoint-123",
+        image_path="fake_image.png",
     )
     line = provider._build_batch_line(request)
 
     assert line["custom_id"] == "q1"
     assert line["method"] == "POST"
     assert line["url"] == "/v1/responses"
+    assert line["body"]["model"] == "fake-endpoint-123"
 
     content = line["body"]["input"][0]["content"]
 
@@ -54,7 +59,12 @@ def test_build_batch_line_with_image():
 def test_build_batch_line_without_image():
     provider = OpenAIProvider(api_key="fake-key-not-used")
 
-    request = PromptRequest(custom_id="q2", prompt="test prompt", image_path=None)
+    request = PromptRequest(
+        custom_id="q2",
+        prompt="test prompt",
+        endpoint="fake-endpoint-123",
+        image_path=None,
+    )
     line = provider._build_batch_line(request)
 
     content = line["body"]["input"][0]["content"]

@@ -10,7 +10,7 @@ from execution.runner import run_pipeline
 from execution.cache import Cache
 from execution.ledger import Ledger
 from tracking.base import NullTracker
-from config import ModelPricing
+from config import ModelPricing, ModelConfig
 from mutations.base import MutationType, Severity
 from domain.item import Item
 
@@ -33,8 +33,13 @@ class FakeProvider:
             [{"property": "technical_quality", "passed": True, "reasoning": ""}]
         )
         return [
-            RawResponse(content=fake_content, input_tokens=100, output_tokens=20)
-            for _ in requests
+            RawResponse(
+                custom_id=request.custom_id,
+                content=fake_content,
+                input_tokens=100,
+                output_tokens=20,
+            )
+            for request in requests
         ]
 
 
@@ -77,6 +82,13 @@ def test_run_pipeline_end_to_end(tmp_path):
     tracker = NullTracker()
     provider = FakeProvider()
 
+    model_configs = {
+        "fake-model": ModelConfig(
+            name="fake-model",
+            provider="openai",
+            endpoint="fake-endpoint",
+        )
+    }
     pricing = {
         "fake-model": ModelPricing(
             input_per_million=Decimal("2.5"), output_per_million=Decimal("15.0")
@@ -94,6 +106,7 @@ def test_run_pipeline_end_to_end(tmp_path):
         ledger=ledger,
         tracker=tracker,
         pricing=pricing,
+        model_configs=model_configs,
         seed=42,
         manifest_path=tmp_path / "manifest.json",
     )
@@ -112,6 +125,13 @@ def test_run_pipeline_skips_completed_work(tmp_path):
     tracker = NullTracker()
     provider = FakeProvider()
 
+    model_configs = {
+        "fake-model": ModelConfig(
+            name="fake-model",
+            provider="openai",
+            endpoint="fake-endpoint",
+        )
+    }
     pricing = {
         "fake-model": ModelPricing(
             input_per_million=Decimal("2.5"), output_per_million=Decimal("15.0")
@@ -129,6 +149,7 @@ def test_run_pipeline_skips_completed_work(tmp_path):
         ledger=ledger,
         tracker=tracker,
         pricing=pricing,
+        model_configs=model_configs,
         seed=42,
         manifest_path=tmp_path / "manifest.json",
     )

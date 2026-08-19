@@ -16,6 +16,7 @@ def make_dataframe(**overrides):
     overriding specific columns for testing edge cases.
     """
     data = {
+        "question_id": ["q1", "q2"],
         "question": ["What is 2+2?", "What is the capital of France?"],
         "choices": ["['3', '4', '5']", "['Paris', 'London', 'Berlin']"],
         "answer": [1, 0],
@@ -29,7 +30,7 @@ def make_dataframe(**overrides):
         "skill": ["basic-math", "geography-facts"],
         "lecture": ["", ""],
         "solution": ["", ""],
-        "split": ["train", "train"],
+        "set": ["train", "train"],
     }
     data.update(overrides)
     return pd.DataFrame.from_dict(data)

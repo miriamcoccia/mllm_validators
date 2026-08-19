@@ -1,0 +1,133 @@
+"""
+cli.py: command-line interface for the MLLM pipeline —
+sample / mutate / run / analyse / report.
+"""
+
+# TODO: Update the names in config, so that everything makes sense. Right now the internal identifier and the api endpoint are different but very similar - confusing!
+import typer
+import pandas as pd
+from pathlib import Path
+
+from data.experiment_sample import build_phase1_sample
+from data.scienceqa import ScienceQALoader
+from execution.runner import run_pipeline
+from execution.cache import Cache
+from execution.ledger import Ledger
+from execution.planner import plan_work
+from evaluation.load import load_results
+from evaluation.curves import detection_rate_by_severity
+from evaluation.figures import plot_detection_by_severity
+from evaluation.tables import detection_rate_table_latex, save_table
+from mutations.base import MutationType, Severity
+from providers.registry import get_provider
+from tracking.registry import get_tracker
+from config import Secrets, load_pricing, load_all_model_configs
+
+app = typer.Typer()
+
+
+@app.command()
+def sample(
+    input_csv: Path = typer.Option(..., help="Path to the full ScienceQA CSV."),
+    output_csv: Path = typer.Option(..., help="Where to save the Phase 1 sample."),
+    fraction: float = typer.Option(0.1, help="Fraction of the data to sample."),
+    stratify_by: str = typer.Option("subject", help="Column to stratify by."),
+    seed: int = typer.Option(42, help="Random seed for reproducibility."),
+) -> None:
+    """Build and save the Phase 1 stratified sample."""
+    df = pd.read_csv(input_csv)
+    sample_df = build_phase1_sample(df, fraction, stratify_by, seed)
+    sample_df.to_csv(output_csv, index=False)
+    typer.echo(f"Saved {len(sample_df)} rows to {output_csv}")
+
+
+@app.command()
+def run(
+    items_csv: Path = typer.Option(..., help="CSV of items to run the pipeline on."),
+    strategies: str = typer.Option("combined", help="Comma-separated: split,combined"),
+    models: str = typer.Option(..., help="Comma-separated model names."),
+    seed: int = typer.Option(42),
+    manifest_path: Path = typer.Option(Path("runs/manifest.json")),
+    dry_run: bool = typer.Option(
+        False, help="Plan the work without submitting anything."
+    ),
+) -> None:
+    """Run the pipeline: plan, submit batches, wait, record results."""
+    df = pd.read_csv(items_csv)
+    loader = ScienceQALoader(df)
+    items = loader.load_items()
+
+    strategy_list = strategies.split(",")
+    model_list = models.split(",")
+    mutation_types = [
+        mt for mt in MutationType if mt != MutationType.FAIR_REPRESENTATION
+    ]
+    severities = list(Severity)
+
+    if dry_run:
+        cache = Cache(Path("runs/cache.txt"))
+        planned_units = plan_work(
+            items, mutation_types, severities, model_list, strategy_list, cache, seed
+        )
+        total = (
+            len(items)
+            * len(mutation_types)
+            * len(severities)
+            * len(model_list)
+            * len(strategy_list)
+        )
+        typer.echo(
+            f"Would run {len(planned_units)} remaining units "
+            f"(out of {total} total; {total - len(planned_units)} already done)."
+        )
+        return
+
+    secrets = Secrets()
+    provider = get_provider("openai", api_key=secrets.openai_api_key)
+    pricing = load_pricing(Path("configs/pricing.yaml"))
+    cache = Cache(Path("runs/cache.txt"))
+    ledger = Ledger(Path("runs/ledger.txt"))
+    tracker = get_tracker("mlflow")
+
+    model_configs = load_all_model_configs(Path("configs/models"))
+    run_pipeline(
+        items=items,
+        mutation_types=mutation_types,
+        severities=severities,
+        models=model_list,
+        strategies=strategy_list,
+        provider=provider,
+        cache=cache,
+        ledger=ledger,
+        tracker=tracker,
+        pricing=pricing,
+        model_configs=model_configs,
+        seed=seed,
+        manifest_path=manifest_path,
+    )
+    typer.echo("Run complete.")
+
+
+@app.command()
+def analyse(
+    results_dir: Path = typer.Option(Path("runs/results")),
+    figure_output: Path = typer.Option(Path("runs/figures/detection_by_severity.png")),
+    table_output: Path = typer.Option(Path("runs/tables/detection_by_severity.tex")),
+) -> None:
+    """Load saved results, compute detection rates, generate figure + table."""
+    results = load_results(results_dir)
+    detection_rates = detection_rate_by_severity(results)
+
+    plot_detection_by_severity(detection_rates, figure_output)
+    latex = detection_rate_table_latex(detection_rates)
+    save_table(latex, table_output)
+
+    for severity, metrics in detection_rates.items():
+        typer.echo(
+            f"{severity}: precision={metrics['precision']:.2f}, "
+            f"recall={metrics['recall']:.2f}, f1={metrics['f1']:.2f}"
+        )
+
+
+if __name__ == "__main__":
+    app()
