@@ -31,15 +31,17 @@ def test_parse_batch_line():
     assert result.output_tokens == 20
 
 
-def test_build_batch_line_with_image():
+def test_build_batch_line_with_image(tmp_path):
     provider = OpenAIProvider(api_key="fake-key-not-used")
-    provider._uploaded_files["fake_image.png"] = "file-fake123"
+
+    image_path = tmp_path / "fake_image.png"
+    image_path.write_bytes(b"fake image bytes")
 
     request = PromptRequest(
         custom_id="q1",
         prompt="test prompt",
         endpoint="fake-endpoint-123",
-        image_path="fake_image.png",
+        image_path=str(image_path),
     )
     line = provider._build_batch_line(request)
 
@@ -53,7 +55,7 @@ def test_build_batch_line_with_image():
     assert content[0]["type"] == "input_text"
     assert content[0]["text"] == "test prompt"
     assert content[1]["type"] == "input_image"
-    assert content[1]["file_id"] == "file-fake123"
+    assert content[1]["image_url"].startswith("data:image/png;base64,")
 
 
 def test_build_batch_line_without_image():

@@ -197,7 +197,13 @@ def run_pipeline(
         fingerprint_by_custom_id[request.custom_id] = fingerprint
         unit_by_custom_id[request.custom_id] = unit
 
-    chunks = chunk_requests(requests, max_per_batch)
+    requests_by_model = {}
+    for request in requests:
+        requests_by_model.setdefault(request.endpoint, []).append(request)
+
+    chunks = []
+    for model_endpoint, model_requests in requests_by_model.items():
+        chunks.extend(chunk_requests(model_requests, max_per_batch))
 
     for chunk in chunks:
         batch_id = provider.submit_batch(chunk)

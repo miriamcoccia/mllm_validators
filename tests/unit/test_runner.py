@@ -159,3 +159,51 @@ def test_run_pipeline_skips_completed_work(tmp_path):
 
     run_pipeline(**kwargs)
     assert len(provider.submitted_batches) == 1
+
+
+def test_run_pipeline_separates_models_into_different_batches(tmp_path):
+    image_path = tmp_path / "original.png"
+    make_test_image(image_path)
+    item1 = make_item(str(image_path))
+
+    cache = Cache(tmp_path / "cache.txt")
+    ledger = Ledger(tmp_path / "ledger.txt")
+    tracker = NullTracker()
+    provider = FakeProvider()
+
+    pricing = {
+        "model-a": ModelPricing(
+            input_per_million=Decimal("2.5"), output_per_million=Decimal("15.0")
+        ),
+        "model-b": ModelPricing(
+            input_per_million=Decimal("2.5"), output_per_million=Decimal("15.0")
+        ),
+    }
+    model_configs = {
+        "model-a": ModelConfig(
+            name="model-a", provider="openai", endpoint="endpoint-a"
+        ),
+        "model-b": ModelConfig(
+            name="model-b", provider="openai", endpoint="endpoint-b"
+        ),
+    }
+
+    run_pipeline(
+        items=[item1],
+        mutation_types=[MutationType.TECHNICAL_QUALITY],
+        severities=[Severity.OBVIOUS],
+        models=["model-a", "model-b"],
+        strategies=["split"],
+        provider=provider,
+        cache=cache,
+        ledger=ledger,
+        tracker=tracker,
+        pricing=pricing,
+        model_configs=model_configs,
+        seed=42,
+        manifest_path=tmp_path / "manifest.json",
+    )
+
+    # 1 item x 1 mutation x 1 severity x 2 models x 1 strategy = 2 total units,
+    # but each model must be its own batch -> 2 separate batches submitted
+    assert len(provider.submitted_batches) == 2

@@ -3,12 +3,14 @@ openai_provider.py: OpenAI implementation of the BatchProvider protocol.
 """
 
 import json
+import base64
 from pathlib import Path
 from openai import OpenAI
 
 from providers.base import BatchProvider, RawResponse, BatchStatus, PromptRequest
 
 BATCH_DIR = Path("runs/batches")
+MAX_BATCH_FILE_BYTES = 190 * 1024 * 1024  # safe margin under OpenAI's 200 MB limit
 
 
 class OpenAIProvider:
@@ -16,29 +18,34 @@ class OpenAIProvider:
         self.client = OpenAI(api_key=api_key)
         self._uploaded_files: dict[str, str] = {}
 
-    def _get_or_upload_image(self, image_path: str) -> str:
+    def _get_or_encode_image(self, image_path: str) -> str:
         if image_path in self._uploaded_files:
             return self._uploaded_files[image_path]
 
         with open(image_path, "rb") as f:
-            result = self.client.files.create(file=f, purpose="vision")
+            encoded = base64.b64encode(f.read()).decode("utf-8")
 
-        self._uploaded_files[image_path] = result.id
-        return result.id
+        self._uploaded_files[image_path] = encoded
+        return encoded
 
     def _build_batch_line(self, request: PromptRequest) -> dict:
         content = [{"type": "input_text", "text": request.prompt}]
 
         if request.image_path is not None:
-            file_id = self._get_or_upload_image(request.image_path)
-            content.append({"type": "input_image", "file_id": file_id})
+            encoded_image = self._get_or_encode_image(request.image_path)
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": f"data:image/png;base64,{encoded_image}",
+                }
+            )
 
         return {
             "custom_id": request.custom_id,
             "method": "POST",
             "url": "/v1/responses",
             "body": {
-                "model": request.endpoint,  # placeholder for now
+                "model": request.endpoint,
                 "input": [{"role": "user", "content": content}],
             },
         }
@@ -47,10 +54,21 @@ class OpenAIProvider:
         BATCH_DIR.mkdir(parents=True, exist_ok=True)
 
         lines = []
+        total_bytes = 0
         for i, request in enumerate(requests):
-            lines.append(self._build_batch_line(request))
+            line = self._build_batch_line(request)
+            lines.append(line)
+            total_bytes += len(json.dumps(line).encode("utf-8"))
             if (i + 1) % 100 == 0 or (i + 1) == len(requests):
-                print(f"Built {i + 1}/{len(requests)} requests...")
+                print(
+                    f"Built {i + 1}/{len(requests)} requests... ({total_bytes / (1024**2):.1f} MB)"
+                )
+
+        if total_bytes > MAX_BATCH_FILE_BYTES:
+            raise ValueError(
+                f"Batch file would be {total_bytes / (1024**2):.1f} MB, over the "
+                f"{MAX_BATCH_FILE_BYTES / (1024**2):.0f} MB safe limit. Lower --max-per-batch."
+            )
 
         batch_file_path = BATCH_DIR / "batch_input.jsonl"
         with open(batch_file_path, "w") as f:
@@ -80,6 +98,11 @@ class OpenAIProvider:
 
     def fetch_batch(self, batch_id: str) -> list[RawResponse]:
         batch = self.client.batches.retrieve(batch_id)
+
+        if batch.output_file_id is None:
+            raise RuntimeError(
+                f"Batch {batch_id} status={batch.status} but has no output_file_id."
+            )
 
         result_file = self.client.files.content(batch.output_file_id)
         lines = result_file.text.strip().split("\n")

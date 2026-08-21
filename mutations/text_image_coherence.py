@@ -21,6 +21,17 @@ class TextImageCoherenceMutation:
 
     def apply(self, item: Item, severity: Severity, seed: int) -> MutatedItem:
         original_path = Path(item.image)
+        new_path = build_mutated_path(
+            item.id, self.name(), severity, original_path.suffix
+        )
+
+        if new_path.exists():
+            return MutatedItem(
+                original=item,
+                mutation_type=MutationType.TEXT_IMAGE_COHERENCE,
+                severity=severity,
+                mutated_image=str(new_path),
+            )
 
         rng = random.Random(seed)
         possible_substitutes = [
@@ -32,10 +43,8 @@ class TextImageCoherenceMutation:
         ]
         substitute = rng.choice(possible_substitutes)
         substitute_path = Path(substitute.image)
+
         substitute_image = Image.open(substitute_path)
-        new_path = build_mutated_path(
-            item.id, self.name(), severity, original_path.suffix
-        )
         substitute_image.save(new_path)
 
         return MutatedItem(

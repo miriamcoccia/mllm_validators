@@ -1,9 +1,8 @@
 """
 cli.py: command-line interface for the MLLM pipeline —
-sample / mutate / run / analyse / report.
+sample / run / analyse.
 """
 
-# TODO: Update the names in config, so that everything makes sense. Right now the internal identifier and the api endpoint are different but very similar - confusing!
 import typer
 import pandas as pd
 from pathlib import Path
@@ -48,6 +47,9 @@ def run(
     models: str = typer.Option(..., help="Comma-separated model names."),
     seed: int = typer.Option(42),
     manifest_path: Path = typer.Option(Path("runs/manifest.json")),
+    max_per_batch: int = typer.Option(
+        1788, help="Max requests per batch (size-limited by base64 images)."
+    ),
     dry_run: bool = typer.Option(
         False, help="Plan the work without submitting anything."
     ),
@@ -77,8 +79,7 @@ def run(
             * len(strategy_list)
         )
         typer.echo(
-            f"Would run {len(planned_units)} remaining units "
-            f"(out of {total} total; {total - len(planned_units)} already done)."
+            f"Would run {len(planned_units)} remaining units (out of {total} total; {total - len(planned_units)} already done)."
         )
         return
 
@@ -88,8 +89,8 @@ def run(
     cache = Cache(Path("runs/cache.txt"))
     ledger = Ledger(Path("runs/ledger.txt"))
     tracker = get_tracker("mlflow")
-
     model_configs = load_all_model_configs(Path("configs/models"))
+
     run_pipeline(
         items=items,
         mutation_types=mutation_types,
@@ -104,6 +105,7 @@ def run(
         model_configs=model_configs,
         seed=seed,
         manifest_path=manifest_path,
+        max_per_batch=max_per_batch,
     )
     typer.echo("Run complete.")
 
@@ -117,15 +119,12 @@ def analyse(
     """Load saved results, compute detection rates, generate figure + table."""
     results = load_results(results_dir)
     detection_rates = detection_rate_by_severity(results)
-
     plot_detection_by_severity(detection_rates, figure_output)
     latex = detection_rate_table_latex(detection_rates)
     save_table(latex, table_output)
-
     for severity, metrics in detection_rates.items():
         typer.echo(
-            f"{severity}: precision={metrics['precision']:.2f}, "
-            f"recall={metrics['recall']:.2f}, f1={metrics['f1']:.2f}"
+            f"{severity}: precision={metrics['precision']:.2f}, recall={metrics['recall']:.2f}, f1={metrics['f1']:.2f}"
         )
 
 

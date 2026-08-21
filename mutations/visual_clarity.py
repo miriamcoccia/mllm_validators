@@ -27,8 +27,19 @@ class ClarityMutation:
         return "clarity_shapes"
 
     def apply(self, item: Item, severity: Severity, seed: int) -> MutatedItem:
-        # 1. open original image, make a copy
         original_path = Path(item.image)
+        new_path = build_mutated_path(
+            item.id, self.name(), severity, original_path.suffix
+        )
+
+        if new_path.exists():
+            return MutatedItem(
+                original=item,
+                mutation_type=MutationType.VISUAL_CLARITY,
+                severity=severity,
+                mutated_image=str(new_path),
+            )
+
         original_image = Image.open(original_path)
         copied_image = original_image.copy()
         draw = ImageDraw.Draw(copied_image)
@@ -40,16 +51,11 @@ class ClarityMutation:
         shape_count = self.SHAPE_COUNT_BY_SEVERITY[severity]
 
         for _ in range(shape_count):
-            # box boundaries
-            # top_corners
             x = rng.randint(0, width - shape_size)
             y = rng.randint(0, height - shape_size)
             color = (rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255))
             draw.ellipse([x, y, x + shape_size, y + shape_size], fill=color)
 
-            new_path = build_mutated_path(
-                item.id, self.name(), severity, original_path.suffix
-            )
         copied_image.save(new_path)
 
         return MutatedItem(
