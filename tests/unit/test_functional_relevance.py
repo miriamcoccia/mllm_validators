@@ -34,7 +34,6 @@ def make_item(image_path: str, item_id: str = "q1", **overrides):
 
 
 def make_test_image(path: Path, color: str) -> None:
-    """Creates a small solid-color test image, as color lets us tell images apart."""
     img = Image.new("RGB", (50, 50), color=color)
     img.save(path)
 
@@ -42,11 +41,11 @@ def make_test_image(path: Path, color: str) -> None:
 def test_relevance_produces_valid_mutated_item(tmp_path):
     image_1_path = tmp_path / "image1.png"
     make_test_image(image_1_path, "red")
-    item_1 = make_item(str(image_1_path), item_id="q1")
+    item_1 = make_item(str(image_1_path), item_id="fr_prod_1")
 
     image_2_path = tmp_path / "image2.png"
     make_test_image(image_2_path, "blue")
-    item_2 = make_item(str(image_2_path), item_id="q2")
+    item_2 = make_item(str(image_2_path), item_id="fr_prod_2")
 
     mutation = FunctionalRelevanceMutation(candidates=[item_1, item_2])
     result = mutation.apply(item_1, Severity.OBVIOUS, seed=42)
@@ -59,35 +58,32 @@ def test_relevance_produces_valid_mutated_item(tmp_path):
 def test_relevance_substitutes_with_different_image(tmp_path):
     image_1_path = tmp_path / "image1.png"
     make_test_image(image_1_path, "red")
-    item_1 = make_item(str(image_1_path), item_id="q1")
+    item_1 = make_item(str(image_1_path), item_id="fr_sub_1")
 
     image_2_path = tmp_path / "image2.png"
     make_test_image(image_2_path, "blue")
-    item_2 = make_item(str(image_2_path), item_id="q2")
+    item_2 = make_item(str(image_2_path), item_id="fr_sub_2")
 
     mutation = FunctionalRelevanceMutation(candidates=[item_1, item_2])
     result = mutation.apply(item_1, Severity.OBVIOUS, seed=42)
 
     mutated_image = Image.open(result.mutated_image).convert("RGB")
     pixel = mutated_image.getpixel((0, 0))
-    assert pixel == (0, 0, 255)  # blue
+    assert pixel == (0, 0, 255)
 
 
 def test_relevance_never_substitutes_with_itself(tmp_path):
-    """
-    Even with a larger pool, the substitute should never be the item's own image.
-    """
     image_1_path = tmp_path / "image1.png"
     make_test_image(image_1_path, "red")
-    item_1 = make_item(str(image_1_path), item_id="q1")
+    item_1 = make_item(str(image_1_path), item_id="fr_never_1")
 
     image_2_path = tmp_path / "image2.png"
     make_test_image(image_2_path, "blue")
-    item_2 = make_item(str(image_2_path), item_id="q2")
+    item_2 = make_item(str(image_2_path), item_id="fr_never_2")
 
     image_3_path = tmp_path / "image3.png"
     make_test_image(image_3_path, "green")
-    item_3 = make_item(str(image_3_path), item_id="q3")
+    item_3 = make_item(str(image_3_path), item_id="fr_never_3")
 
     mutation = FunctionalRelevanceMutation(candidates=[item_1, item_2, item_3])
 

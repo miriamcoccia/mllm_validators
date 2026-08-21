@@ -92,12 +92,14 @@ class NebiusProvider:
 
     def _parse_batch_line(self, line: str) -> RawResponse:
         data = json.loads(line)
+        custom_id = data["custom_id"]
         body = data["response"]["body"]
 
         content = body["choices"][0]["message"]["content"]
         usage = body["usage"]
 
         return RawResponse(
+            custom_id=custom_id,
             content=content,
             input_tokens=usage["prompt_tokens"],
             output_tokens=usage["completion_tokens"],

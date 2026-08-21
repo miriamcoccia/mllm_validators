@@ -10,6 +10,7 @@ from providers.base import PromptRequest
 def test_parse_batch_line():
     fake_line = json.dumps(
         {
+            "custom_id": "test_id_1",
             "response": {
                 "body": {
                     "choices": [
@@ -22,7 +23,7 @@ def test_parse_batch_line():
                     ],
                     "usage": {"prompt_tokens": 100, "completion_tokens": 20},
                 }
-            }
+            },
         }
     )
 
@@ -39,7 +40,10 @@ def test_build_batch_line_with_image():
     provider._encoded_images["fake_image.png"] = "fakebase64content"
 
     request = PromptRequest(
-        custom_id="q1", prompt="test prompt", image_path="fake_image.png"
+        custom_id="q1",
+        prompt="test prompt",
+        image_path="fake_image.png",
+        endpoint="test-endpoint",
     )
     line = provider._build_batch_line(request)
 

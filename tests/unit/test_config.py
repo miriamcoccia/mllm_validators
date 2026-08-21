@@ -35,6 +35,7 @@ def test_load_model_config_reads_valid_yaml(tmp_path):
     yaml_content = """
     name: gpt-4
     provider: openai
+    endpoint: gpt-4-0613
     """
 
     config_file = tmp_path / "gpt-4.yaml"
@@ -44,6 +45,7 @@ def test_load_model_config_reads_valid_yaml(tmp_path):
 
     assert config.name == "gpt-4"
     assert config.provider == "openai"
+    assert config.endpoint == "gpt-4-0613"
 
 
 def test_load_model_config_missing_fields_raises(tmp_path):
