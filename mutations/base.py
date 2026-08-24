@@ -23,6 +23,18 @@ def build_mutated_path(
     return item_dir / f"{mutation_name}_{severity.value}{suffix}"
 
 
+def build_mutated_path_no_severity(
+    item_id: str, mutation_name: str, suffix: str
+) -> Path:
+    """
+    Builds the standard output path for a mutated image with no severity:
+    data/mutated/{item_id}/{mutation_name}{suffix}
+    """
+    item_dir = MUTATED_DIR / item_id
+    item_dir.mkdir(parents=True, exist_ok=True)
+    return item_dir / f"{mutation_name}{suffix}"
+
+
 class Severity(StrEnum):
     SUBTLE = "subtle"
     MODERATE = "moderate"
