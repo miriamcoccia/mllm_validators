@@ -18,6 +18,7 @@ from evaluation.curves import detection_rate_by_severity
 from evaluation.figures import plot_detection_by_severity
 from evaluation.tables import detection_rate_table_latex, save_table
 from mutations.base import MutationType, Severity
+from mutations.fair_representation_pool import build_candidate_pool
 from providers.registry import get_provider
 from tracking.registry import get_tracker
 from config import Secrets, load_pricing, load_all_model_configs
@@ -53,6 +54,14 @@ def run(
     dry_run: bool = typer.Option(
         False, help="Plan the work without submitting anything."
     ),
+    cmsc_pool_dir: Path = typer.Option(
+        None,
+        help=(
+            "Root of a local CMSC checkout, used to build the fair_representation "
+            "candidate pool. If omitted, fair_representation is left out of the "
+            "run entirely, same as before this flag existed."
+        ),
+    ),
 ) -> None:
     """Run the pipeline: plan, submit batches, wait, record results."""
     df = pd.read_csv(items_csv)
@@ -61,10 +70,22 @@ def run(
 
     strategy_list = strategies.split(",")
     model_list = models.split(",")
-    mutation_types = [
-        mt for mt in MutationType if mt != MutationType.FAIR_REPRESENTATION
-    ]
     severities = list(Severity)
+
+    fair_representation_candidates: list[str] | None = None
+    if cmsc_pool_dir is not None:
+        fair_representation_candidates = build_candidate_pool(cmsc_pool_dir)
+        if not fair_representation_candidates:
+            typer.echo(
+                f"Warning: no fair_representation candidates found under {cmsc_pool_dir} "
+                "— check the flagged-combinations list matches folders that actually exist. "
+                "Continuing without fair_representation."
+            )
+        mutation_types = list(MutationType)
+    else:
+        mutation_types = [
+            mt for mt in MutationType if mt != MutationType.FAIR_REPRESENTATION
+        ]
 
     if dry_run:
         cache = Cache(Path("runs/cache.txt"))
@@ -106,6 +127,7 @@ def run(
         seed=seed,
         manifest_path=manifest_path,
         max_per_batch=max_per_batch,
+        fair_representation_candidates=fair_representation_candidates,
     )
     typer.echo("Run complete.")
 

@@ -28,13 +28,17 @@ from execution.manifest import Manifest, get_git_commit, check_manifest
 from execution.results import save_result
 
 
-def build_mutations_by_type(items: list[Item]) -> dict[MutationType, Mutation]:
+def build_mutations_by_type(
+    items: list[Item], fair_representation_candidates: list[str] | None = None
+) -> dict[MutationType, Mutation]:
     """
-    Constructs one instance of each available mutation, upfront.
-    Substitution-based mutations need the full item pool as candidates.
-    NOTE: fair_representation is intentionally absent — shelved, see project notes.
+    Initializes one instance of each mutation type.
+
+    * Relevance and coherence mutations use ScienceQA items as candidates.
+    * Fair representation uses an optional external image pool.
+    * Omitting the external pool safely excludes the fair representation mutation.
     """
-    return {
+    mutations_by_type = {
         MutationType.TECHNICAL_QUALITY: get_mutation("blur"),
         MutationType.STANDARD_PRESENTATION: get_mutation("rotate"),
         MutationType.VISUAL_CLARITY: get_mutation("clarity_shapes"),
@@ -45,6 +49,13 @@ def build_mutations_by_type(items: list[Item]) -> dict[MutationType, Mutation]:
             "coherence_substitution", candidates=items
         ),
     }
+
+    if fair_representation_candidates:
+        mutations_by_type[MutationType.FAIR_REPRESENTATION] = get_mutation(
+            "fair_repr_substitution", candidates=fair_representation_candidates
+        )
+
+    return mutations_by_type
 
 
 def build_request_for_unit(
@@ -167,12 +178,15 @@ def run_pipeline(
     manifest_path: Path,
     max_per_batch: int = 50_000,
     poll_interval_seconds: int = 15,
+    fair_representation_candidates: list[str] | None = None,
 ) -> None:
     """
     Runs the full pipeline: plans remaining work, applies mutations,
     submits it in batches, waits for completion, records results.
     """
-
+    mutations_by_type = build_mutations_by_type(
+        items, fair_representation_candidates
+    )  # <- was build_mutations_by_type(items)
     manifest = Manifest(git_commit=get_git_commit(), models=models, seed=seed)
     check_manifest(manifest, manifest_path)
     planned_units = plan_work(
