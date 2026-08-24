@@ -17,13 +17,3 @@ def calculate_cost(
     output_cost = (pricing.output_per_million * output_tokens) / 1_000_000
 
     return input_cost + output_cost
-
-
-def total_cost_by_strategy(results: list) -> dict[str, float]:
-    """
-    Sums total cost, grouped by strategy.
-    """
-    totals = {}
-    for result in results:
-        totals[result.strategy] = totals.get(result.strategy, 0.0) + result.cost
-    return totals

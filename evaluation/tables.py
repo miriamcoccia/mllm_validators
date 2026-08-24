@@ -85,3 +85,76 @@ def strategy_severity_table_latex(breakdown: dict[tuple, dict]) -> str:
     lines.append(r"\end{table}")
 
     return "\n".join(lines)
+
+
+def two_dimension_table_latex(
+    breakdown: dict[tuple, dict],
+    col1_name: str,
+    col2_name: str,
+    col1_order: list[str],
+    col2_order: list[str],
+    caption: str,
+    label: str,
+) -> str:
+    """
+    Builds a LaTeX table from any two-dimension breakdown (e.g. model x severity).
+    """
+    lines = []
+    lines.append(r"\begin{table}[h]")
+    lines.append(r"\centering")
+    lines.append(r"\begin{tabular}{llccc}")
+    lines.append(r"\toprule")
+    lines.append(f"{col1_name} & {col2_name} & Precision & Recall & F1 \\\\")
+    lines.append(r"\midrule")
+
+    for c1 in col1_order:
+        for c2 in col2_order:
+            key = (c1, c2)
+            if key not in breakdown:
+                continue
+            m = breakdown[key]
+            lines.append(
+                f"{c1} & {c2.capitalize()} & {m['precision']:.2f} & {m['recall']:.2f} & {m['f1']:.2f} \\\\"
+            )
+        lines.append(r"\midrule")
+
+    lines.pop()
+    lines.append(r"\bottomrule")
+    lines.append(r"\end{tabular}")
+    lines.append(f"\\caption{{{caption}}}")
+    lines.append(f"\\label{{{label}}}")
+    lines.append(r"\end{table}")
+
+    return "\n".join(lines)
+
+
+def cost_summary_table_latex(
+    cost_by_model: dict[str, float], total_results: int
+) -> str:
+    """
+    Builds a LaTeX table summarizing total cost per model and the total
+    number of results processed.
+    """
+    lines = []
+    lines.append(r"\begin{table}[h]")
+    lines.append(r"\centering")
+    lines.append(r"\begin{tabular}{lr}")
+    lines.append(r"\toprule")
+    lines.append(r"Model & Total cost (\$) \\")
+    lines.append(r"\midrule")
+
+    for model, cost in cost_by_model.items():
+        lines.append(f"{model} & {cost:.2f} \\\\")
+
+    total_cost = sum(cost_by_model.values())
+    lines.append(r"\midrule")
+    lines.append(f"Total & {total_cost:.2f} \\\\")
+    lines.append(r"\bottomrule")
+    lines.append(r"\end{tabular}")
+    lines.append(
+        f"\\caption{{Total cost by model, and total items processed: {total_results}.}}"
+    )
+    lines.append(r"\label{tab:cost-summary}")
+    lines.append(r"\end{table}")
+
+    return "\n".join(lines)

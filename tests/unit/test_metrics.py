@@ -29,3 +29,9 @@ def test_compute_metrics_partial():
     assert result["precision"] == 0.5
     assert result["recall"] == 0.4
     assert 0.43 < result["f1"] <= 0.45
+
+
+def test_compute_metrics_zero_true_positives_and_false_positives():
+    counts = {"tp": 0, "fp": 0, "fn": 3, "tn": 0}
+    result = compute_metrics(counts)
+    assert result == {"precision": 0.0, "recall": 0.0, "f1": 0.0}

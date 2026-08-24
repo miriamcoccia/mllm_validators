@@ -41,7 +41,7 @@ def compute_metrics(counts: dict) -> dict:
     fp = counts["fp"]
     fn = counts["fn"]
 
-    precision = tp / (tp + fp) if (tp + fn) > 0 else 0.0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = (
         2 * (precision * recall) / (precision + recall)
