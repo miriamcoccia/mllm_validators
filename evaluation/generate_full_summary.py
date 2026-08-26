@@ -115,3 +115,6 @@ plot_detection_by_severity(
 )
 
 print(f"Saved everything to {output_dir}/")
+
+
+# TODO: check which traits have been affected collaterally

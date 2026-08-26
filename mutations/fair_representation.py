@@ -19,7 +19,7 @@ class FairRepresentationMutation:
         self.candidates = candidates
 
     def name(self) -> str:
-        return "fair_representation"
+        return "fair_representation_swap"
 
     def apply(self, item: Item, severity: Severity, seed: int) -> MutatedItem:
         original_path = Path(item.image)

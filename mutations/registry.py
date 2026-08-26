@@ -8,6 +8,7 @@ from mutations.standard_presentation import RotateMutation
 from mutations.visual_clarity import ClarityMutation
 from mutations.functional_relevance import FunctionalRelevanceMutation
 from mutations.text_image_coherence import TextImageCoherenceMutation
+from mutations.fair_representation import FairRepresentationMutation
 
 MUTATIONS: dict[str, type] = {
     "funct_relevance_substitution": FunctionalRelevanceMutation,
@@ -15,6 +16,7 @@ MUTATIONS: dict[str, type] = {
     "blur": BlurMutation,
     "coherence_substitution": TextImageCoherenceMutation,
     "clarity_shapes": ClarityMutation,
+    "fair_representation_swap": FairRepresentationMutation,
 }
 
 
