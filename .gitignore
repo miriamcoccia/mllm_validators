@@ -18,3 +18,8 @@ runs/
 # scratch files
 scratch.py
 mlflow.db
+codebase_dump.txt
+phase4_control_log.txt
+phase3_fair_representation_log.txt
+masterplan.md
+dump_codebase.py
