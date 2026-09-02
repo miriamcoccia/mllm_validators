@@ -9,7 +9,11 @@ from statsmodels.stats.contingency_tables import mcnemar
 
 from evaluation.load import LoadedResult
 from evaluation.metrics import compute_confusion_counts, compute_metrics
-from domain.properties import QualityProperty
+from evaluation.metrics import (
+    compute_confusion_counts,
+    compute_metrics,
+    ground_truth_property,
+)
 
 
 def did_catch_damage(result: LoadedResult) -> bool:
@@ -19,7 +23,7 @@ def did_catch_damage(result: LoadedResult) -> bool:
     or incomplete response), this counts as NOT caught — a missed detection,
     not a silent pass.
     """
-    damaged_property = QualityProperty(result.mutation_type)
+    damaged_property = ground_truth_property(result.mutation_type)
     for verdict in result.verdicts:
         if verdict.property == damaged_property:
             return not verdict.passed
@@ -96,7 +100,7 @@ def bootstrap_recall_ci(
 
     point_counts = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
     for result in results:
-        damaged_property = QualityProperty(result.mutation_type)
+        damaged_property = ground_truth_property(result.mutation_type)
         counts = compute_confusion_counts(result.verdicts, damaged_property)
         for key in point_counts:
             point_counts[key] += counts[key]
@@ -108,7 +112,7 @@ def bootstrap_recall_ci(
 
         counts = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
         for result in resample:
-            damaged_property = QualityProperty(result.mutation_type)
+            damaged_property = ground_truth_property(result.mutation_type)
             result_counts = compute_confusion_counts(result.verdicts, damaged_property)
             for key in counts:
                 counts[key] += result_counts[key]

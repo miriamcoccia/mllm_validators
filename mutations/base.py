@@ -48,6 +48,7 @@ class MutationType(StrEnum):
     FUNCTIONAL_RELEVANCE = "functional_relevance"
     FAIR_REPRESENTATION = "fair_representation"
     TEXT_IMAGE_COHERENCE = "text_image_coherence"
+    FAIR_REPRESENTATION_CONTROL = "fair_representation_control"
 
 
 @dataclass(frozen=True)

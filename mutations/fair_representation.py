@@ -22,9 +22,10 @@ class FairRepresentationMutation:
         return "fair_representation_swap"
 
     def apply(self, item: Item, severity: Severity, seed: int) -> MutatedItem:
-        original_path = Path(item.image)
+        rng = random.Random(seed)
+        substitute = rng.choice(self.candidates)
         new_path = build_mutated_path_no_severity(
-            item.id, self.name(), original_path.suffix
+            item.id, self.name(), Path(substitute).suffix
         )
 
         if new_path.exists():
@@ -35,8 +36,6 @@ class FairRepresentationMutation:
                 mutated_image=str(new_path),
             )
 
-        rng = random.Random(seed)
-        substitute = rng.choice(self.candidates)
         substitute_image = Image.open(substitute)
         substitute_image.save(new_path)
 

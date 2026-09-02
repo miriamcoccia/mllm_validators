@@ -1,0 +1,53 @@
+nohup: ignoring input
+Built 100/1535 requests... (11.1 MB)
+Built 200/1535 requests... (20.2 MB)
+Built 300/1535 requests... (28.6 MB)
+Built 400/1535 requests... (37.6 MB)
+Built 500/1535 requests... (47.0 MB)
+Built 600/1535 requests... (55.8 MB)
+Built 700/1535 requests... (64.9 MB)
+Built 800/1535 requests... (74.5 MB)
+Built 900/1535 requests... (83.7 MB)
+Built 1000/1535 requests... (91.0 MB)
+Built 1100/1535 requests... (99.3 MB)
+Built 1200/1535 requests... (107.3 MB)
+Built 1300/1535 requests... (117.0 MB)
+Built 1400/1535 requests... (126.1 MB)
+Built 1500/1535 requests... (133.6 MB)
+Built 1535/1535 requests... (136.6 MB)
+Submitted batch batch_6a954cefbd8881909313834464254d02 with 1535 requests.
+Batch batch_6a954cefbd8881909313834464254d02 fully processed and removed from ledger.
+Built 100/405 requests... (8.7 MB)
+Built 200/405 requests... (17.8 MB)
+Built 300/405 requests... (27.0 MB)
+Built 400/405 requests... (35.2 MB)
+Built 405/405 requests... (35.6 MB)
+Submitted batch batch_6a955d9421008190aeabff42adc62542 with 405 requests.
+Batch batch_6a955d9421008190aeabff42adc62542 fully processed and removed from ledger.
+Built 100/1535 requests... (11.1 MB)
+Built 200/1535 requests... (20.2 MB)
+Built 300/1535 requests... (28.6 MB)
+Built 400/1535 requests... (37.6 MB)
+Built 500/1535 requests... (47.0 MB)
+Built 600/1535 requests... (55.8 MB)
+Built 700/1535 requests... (64.9 MB)
+Built 800/1535 requests... (74.5 MB)
+Built 900/1535 requests... (83.7 MB)
+Built 1000/1535 requests... (91.0 MB)
+Built 1100/1535 requests... (99.3 MB)
+Built 1200/1535 requests... (107.3 MB)
+Built 1300/1535 requests... (117.0 MB)
+Built 1400/1535 requests... (126.1 MB)
+Built 1500/1535 requests... (133.6 MB)
+Built 1535/1535 requests... (136.6 MB)
+Submitted batch batch_6a95609ee2ec8190b7b51ce4a4dafcb2 with 1535 requests.
+Failed to parse response for 4bbecfaee84363ee9b8bfa112a64ffb508eedc6ce021a6dbd8f611840237fd6a: Expecting ',' delimiter: line 8 column 20 (char 114)
+Batch batch_6a95609ee2ec8190b7b51ce4a4dafcb2 fully processed and removed from ledger.
+Built 100/405 requests... (8.7 MB)
+Built 200/405 requests... (17.8 MB)
+Built 300/405 requests... (27.0 MB)
+Built 400/405 requests... (35.2 MB)
+Built 405/405 requests... (35.6 MB)
+Submitted batch batch_6a9564edf7cc8190a361e88fbe049092 with 405 requests.
+Batch batch_6a9564edf7cc8190a361e88fbe049092 fully processed and removed from ledger.
+Run complete.

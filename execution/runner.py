@@ -48,11 +48,12 @@ def build_mutations_by_type(
         MutationType.TEXT_IMAGE_COHERENCE: get_mutation(
             "coherence_substitution", candidates=items
         ),
+        MutationType.FAIR_REPRESENTATION_CONTROL: get_mutation("no_op_control"),
     }
 
     if fair_representation_candidates:
         mutations_by_type[MutationType.FAIR_REPRESENTATION] = get_mutation(
-            "fair_repr_substitution", candidates=fair_representation_candidates
+            "fair_repr_swap", candidates=fair_representation_candidates
         )
 
     return mutations_by_type
@@ -184,9 +185,7 @@ def run_pipeline(
     Runs the full pipeline: plans remaining work, applies mutations,
     submits it in batches, waits for completion, records results.
     """
-    mutations_by_type = build_mutations_by_type(
-        items, fair_representation_candidates
-    )  # <- was build_mutations_by_type(items)
+    mutations_by_type = build_mutations_by_type(items, fair_representation_candidates)
     manifest = Manifest(git_commit=get_git_commit(), models=models, seed=seed)
     check_manifest(manifest, manifest_path)
     planned_units = plan_work(
@@ -197,7 +196,7 @@ def run_pipeline(
         print("Nothing to do — all work already completed.")
         return
 
-    mutations_by_type = build_mutations_by_type(items)
+    # mutations_by_type = build_mutations_by_type(items)
 
     requests = []
     fingerprint_by_custom_id = {}

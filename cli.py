@@ -62,6 +62,14 @@ def run(
             "run entirely, same as before this flag existed."
         ),
     ),
+    mutations: str = typer.Option(
+        None,
+        help=(
+            "Comma-separated mutation type values to run, e.g. 'fair_representation' "
+            "or 'blur,rotate'. If omitted, falls back to the old default: everything "
+            "except fair_representation, unless --cmsc-pool-dir is given."
+        ),
+    ),
 ) -> None:
     """Run the pipeline: plan, submit batches, wait, record results."""
     df = pd.read_csv(items_csv)
@@ -81,6 +89,27 @@ def run(
                 "— check the flagged-combinations list matches folders that actually exist. "
                 "Continuing without fair_representation."
             )
+
+    if mutations is not None:
+        requested_values = mutations.split(",")
+        mutation_types = [mt for mt in MutationType if mt.value in requested_values]
+
+        unknown = set(requested_values) - {mt.value for mt in MutationType}
+        if unknown:
+            typer.echo(f"Unknown mutation type(s): {', '.join(unknown)}")
+            raise typer.Exit(code=1)
+
+        if (
+            MutationType.FAIR_REPRESENTATION in mutation_types
+            and fair_representation_candidates is None
+        ):
+            typer.echo(
+                "fair_representation was requested via --mutations, but "
+                "--cmsc-pool-dir was not given. Pass --cmsc-pool-dir to build "
+                "the candidate pool."
+            )
+            raise typer.Exit(code=1)
+    elif cmsc_pool_dir is not None:
         mutation_types = list(MutationType)
     else:
         mutation_types = [

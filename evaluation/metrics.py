@@ -6,6 +6,18 @@ from domain.verdict import Verdict
 from domain.properties import QualityProperty
 
 
+def ground_truth_property(mutation_type: str) -> QualityProperty:
+    """
+    Maps a saved result's mutation_type string to the QualityProperty it
+    should be judged against. The fair_representation_control mutation
+    doesn't damage anything, but it's still testing fair_representation
+    specifically (on an undamaged image), so it maps to that same property.
+    """
+    if mutation_type == "fair_representation_control":
+        return QualityProperty.FAIR_REPRESENTATION
+    return QualityProperty(mutation_type)
+
+
 def compute_confusion_counts(
     verdicts: list[Verdict], damaged_property: QualityProperty
 ) -> dict:

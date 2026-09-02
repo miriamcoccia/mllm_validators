@@ -6,6 +6,23 @@ whether models catch more obvious damage more reliably.
 from evaluation.load import LoadedResult
 from evaluation.metrics import compute_confusion_counts, compute_metrics
 from domain.properties import QualityProperty
+from evaluation.metrics import (
+    compute_confusion_counts,
+    compute_metrics,
+    ground_truth_property,
+)
+
+
+def _ground_truth_property(mutation_type: str) -> QualityProperty:
+    """
+    Maps a saved result's mutation_type string to the QualityProperty it
+    should be judged against. The control mutation doesn't damage anything,
+    but it's still testing fair_representation specifically (on an
+    undamaged image), so it maps to that same property.
+    """
+    if mutation_type == "fair_representation_control":
+        return QualityProperty.FAIR_REPRESENTATION
+    return QualityProperty(mutation_type)
 
 
 def detection_rate_by_severity(results: list[LoadedResult]) -> dict[str, dict]:
@@ -18,7 +35,7 @@ def detection_rate_by_severity(results: list[LoadedResult]) -> dict[str, dict]:
         if severity not in grouped:
             grouped[severity] = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
 
-        damaged_property = QualityProperty(result.mutation_type)
+        damaged_property = ground_truth_property(result.mutation_type)
 
         counts = compute_confusion_counts(result.verdicts, damaged_property)
         grouped[severity]["tp"] += counts["tp"]
@@ -48,7 +65,7 @@ def detection_rate_by(
         if key not in grouped:
             grouped[key] = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
 
-        damaged_property = QualityProperty(result.mutation_type)
+        damaged_property = ground_truth_property(result.mutation_type)
         counts = compute_confusion_counts(result.verdicts, damaged_property)
 
         for k in grouped[key]:

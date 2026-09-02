@@ -1,0 +1,5077 @@
+# ===== cli.py =====
+"""
+cli.py: command-line interface for the MLLM pipeline —
+sample / run / analyse.
+"""
+
+import typer
+import pandas as pd
+from pathlib import Path
+
+from data.experiment_sample import build_phase1_sample
+from data.scienceqa import ScienceQALoader
+from execution.runner import run_pipeline
+from execution.cache import Cache
+from execution.ledger import Ledger
+from execution.planner import plan_work
+from evaluation.load import load_results
+from evaluation.curves import detection_rate_by_severity
+from evaluation.figures import plot_detection_by_severity
+from evaluation.tables import detection_rate_table_latex, save_table
+from mutations.base import MutationType, Severity
+from mutations.fair_representation_pool import build_candidate_pool
+from providers.registry import get_provider
+from tracking.registry import get_tracker
+from config import Secrets, load_pricing, load_all_model_configs
+
+app = typer.Typer()
+
+
+@app.command()
+def sample(
+    input_csv: Path = typer.Option(..., help="Path to the full ScienceQA CSV."),
+    output_csv: Path = typer.Option(..., help="Where to save the Phase 1 sample."),
+    fraction: float = typer.Option(0.1, help="Fraction of the data to sample."),
+    stratify_by: str = typer.Option("subject", help="Column to stratify by."),
+    seed: int = typer.Option(42, help="Random seed for reproducibility."),
+) -> None:
+    """Build and save the Phase 1 stratified sample."""
+    df = pd.read_csv(input_csv)
+    sample_df = build_phase1_sample(df, fraction, stratify_by, seed)
+    sample_df.to_csv(output_csv, index=False)
+    typer.echo(f"Saved {len(sample_df)} rows to {output_csv}")
+
+
+@app.command()
+def run(
+    items_csv: Path = typer.Option(..., help="CSV of items to run the pipeline on."),
+    strategies: str = typer.Option("combined", help="Comma-separated: split,combined"),
+    models: str = typer.Option(..., help="Comma-separated model names."),
+    seed: int = typer.Option(42),
+    manifest_path: Path = typer.Option(Path("runs/manifest.json")),
+    max_per_batch: int = typer.Option(
+        1788, help="Max requests per batch (size-limited by base64 images)."
+    ),
+    dry_run: bool = typer.Option(
+        False, help="Plan the work without submitting anything."
+    ),
+    cmsc_pool_dir: Path = typer.Option(
+        None,
+        help=(
+            "Root of a local CMSC checkout, used to build the fair_representation "
+            "candidate pool. If omitted, fair_representation is left out of the "
+            "run entirely, same as before this flag existed."
+        ),
+    ),
+    mutations: str = typer.Option(
+        None,
+        help=(
+            "Comma-separated mutation type values to run, e.g. 'fair_representation' "
+            "or 'blur,rotate'. If omitted, falls back to the old default: everything "
+            "except fair_representation, unless --cmsc-pool-dir is given."
+        ),
+    ),
+) -> None:
+    """Run the pipeline: plan, submit batches, wait, record results."""
+    df = pd.read_csv(items_csv)
+    loader = ScienceQALoader(df)
+    items = loader.load_items()
+
+    strategy_list = strategies.split(",")
+    model_list = models.split(",")
+    severities = list(Severity)
+
+    fair_representation_candidates: list[str] | None = None
+    if cmsc_pool_dir is not None:
+        fair_representation_candidates = build_candidate_pool(cmsc_pool_dir)
+        if not fair_representation_candidates:
+            typer.echo(
+                f"Warning: no fair_representation candidates found under {cmsc_pool_dir} "
+                "— check the flagged-combinations list matches folders that actually exist. "
+                "Continuing without fair_representation."
+            )
+
+    if mutations is not None:
+        requested_values = mutations.split(",")
+        mutation_types = [mt for mt in MutationType if mt.value in requested_values]
+
+        unknown = set(requested_values) - {mt.value for mt in MutationType}
+        if unknown:
+            typer.echo(f"Unknown mutation type(s): {', '.join(unknown)}")
+            raise typer.Exit(code=1)
+
+        if (
+            MutationType.FAIR_REPRESENTATION in mutation_types
+            and fair_representation_candidates is None
+        ):
+            typer.echo(
+                "fair_representation was requested via --mutations, but "
+                "--cmsc-pool-dir was not given. Pass --cmsc-pool-dir to build "
+                "the candidate pool."
+            )
+            raise typer.Exit(code=1)
+    elif cmsc_pool_dir is not None:
+        mutation_types = list(MutationType)
+    else:
+        mutation_types = [
+            mt for mt in MutationType if mt != MutationType.FAIR_REPRESENTATION
+        ]
+
+    if dry_run:
+        cache = Cache(Path("runs/cache.txt"))
+        planned_units = plan_work(
+            items, mutation_types, severities, model_list, strategy_list, cache, seed
+        )
+        total = (
+            len(items)
+            * len(mutation_types)
+            * len(severities)
+            * len(model_list)
+            * len(strategy_list)
+        )
+        typer.echo(
+            f"Would run {len(planned_units)} remaining units (out of {total} total; {total - len(planned_units)} already done)."
+        )
+        return
+
+    secrets = Secrets()
+    provider = get_provider("openai", api_key=secrets.openai_api_key)
+    pricing = load_pricing(Path("configs/pricing.yaml"))
+    cache = Cache(Path("runs/cache.txt"))
+    ledger = Ledger(Path("runs/ledger.txt"))
+    tracker = get_tracker("mlflow")
+    model_configs = load_all_model_configs(Path("configs/models"))
+
+    run_pipeline(
+        items=items,
+        mutation_types=mutation_types,
+        severities=severities,
+        models=model_list,
+        strategies=strategy_list,
+        provider=provider,
+        cache=cache,
+        ledger=ledger,
+        tracker=tracker,
+        pricing=pricing,
+        model_configs=model_configs,
+        seed=seed,
+        manifest_path=manifest_path,
+        max_per_batch=max_per_batch,
+        fair_representation_candidates=fair_representation_candidates,
+    )
+    typer.echo("Run complete.")
+
+
+@app.command()
+def analyse(
+    results_dir: Path = typer.Option(Path("runs/results")),
+    figure_output: Path = typer.Option(Path("runs/figures/detection_by_severity.png")),
+    table_output: Path = typer.Option(Path("runs/tables/detection_by_severity.tex")),
+) -> None:
+    """Load saved results, compute detection rates, generate figure + table."""
+    results = load_results(results_dir)
+    detection_rates = detection_rate_by_severity(results)
+    plot_detection_by_severity(detection_rates, figure_output)
+    latex = detection_rate_table_latex(detection_rates)
+    save_table(latex, table_output)
+    for severity, metrics in detection_rates.items():
+        typer.echo(
+            f"{severity}: precision={metrics['precision']:.2f}, recall={metrics['recall']:.2f}, f1={metrics['f1']:.2f}"
+        )
+
+
+if __name__ == "__main__":
+    app()
+
+# ===== config.py =====
+"""
+config.py: This file contains the instructions to handle various I/O operations safely
+"""
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel, ConfigDict
+import yaml
+from pathlib import Path
+from decimal import Decimal
+from typing import Optional
+
+
+class Secrets(BaseSettings):
+    """
+    Reads API keys from environment variables (or a .env file).
+    Never commit real values.
+    """
+
+    model_config = SettingsConfigDict(extra="forbid", env_file=".env")
+
+    openai_api_key: str
+    nebius_api_key: str
+
+
+class ModelConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    provider: str
+    endpoint: str
+    temperature: Optional[float] = None
+
+
+class ModelPricing(BaseModel):
+    """
+    Pricing info for one AI model, loaded from configs/pricing.yaml
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    input_per_million: Decimal
+    output_per_million: Decimal
+
+
+def load_model_config(path: Path) -> ModelConfig:
+    """
+    Reads a YAML file and returns a validated ModelConfig.
+    Raises yaml.YAMLError if the file isn't valid YAML,
+    or pydantic.ValidationError if the fields don't match ModelConfig.
+    """
+    with open(path) as file:
+        data = yaml.safe_load(file)
+    return ModelConfig(**data)
+
+
+def load_all_model_configs(configs_dir: Path) -> dict[str, ModelConfig]:
+    """
+    Loads every model YAML file in configs_dir into a dict, keyed by model name.
+    """
+    configs = {}
+    for yaml_file in configs_dir.glob("*.yaml"):
+        model_config = load_model_config(yaml_file)
+        configs[model_config.name] = model_config
+    return configs
+
+
+def openai_model_names(model_configs: dict) -> list[str]:
+    """
+    Returns the names of all models whose provider is "openai" —
+    used to scope real runs to OpenAI only, given Nebius/Anthropic
+    are currently excluded.
+    """
+    return [
+        name for name, config in model_configs.items() if config.provider == "openai"
+    ]
+
+
+def load_pricing(path: Path) -> dict[str, ModelPricing]:
+    """
+    Reads pricing.yaml and eturns a dict mapping model name -> ModelPricing.
+    """
+    with open(path) as file:
+        data = yaml.safe_load(file)
+        return {key: ModelPricing(**value) for key, value in data.items()}
+
+# ===== domain/__init__.py =====
+
+
+# ===== domain/errors.py =====
+"""
+errors.py: This file handles specific errors that may arise when running the project. Domain errors include errors about the Item and Verdict.
+"""
+
+class DomainError(Exception):
+    """Base class for all domain-layer errors."""
+    pass
+
+class ItemError(DomainError):
+    """Raised when an Item does not match the correct format."""
+    pass
+
+class VerdictError(DomainError):
+    """Raised when the verdict is not in the correct format."""
+    pass
+
+class InvalidRubricError(DomainError):
+    """Raised when a rubric is missing or malformed for a given property."""
+    pass
+
+# ===== domain/item.py =====
+"""
+item.py: defines what a question item is. For the scope of this project, it must contain an image.
+"""
+from dataclasses import dataclass
+from typing import Tuple
+from domain.errors import ItemError
+
+@dataclass(frozen=True)
+class Item:
+    id: str
+    question: str
+    choices: Tuple[str, ...]
+    answer: int
+    hint: str
+    image: str
+    task: str
+    grade: str
+    subject: str
+    topic: str
+    category: str
+    skill: str
+    lecture: str
+    solution: str
+    split: str
+
+    def __post_init__(self):
+        if len(self.choices) == 0:
+            raise ItemError("No multiple-choice options were provided.")
+        if not (0 <= self.answer < len(self.choices)):
+            raise ItemError("The answer should be chosen from one of the available options.")
+        
+
+# ===== domain/properties.py =====
+"""
+properties.py: In this file, we define the names of the properties to be used throughout the project
+alongside their definitions.
+"""
+
+from enum import StrEnum
+from dataclasses import dataclass
+from types import MappingProxyType
+
+
+class QualityProperty(StrEnum):
+    FUNCTIONAL_RELEVANCE = "functional_relevance"
+    VISUAL_CLARITY = "visual_clarity"
+    TECHNICAL_QUALITY = "technical_quality"
+    STANDARD_PRESENTATION = "standard_presentation"
+    TEXT_IMAGE_COHERENCE = "text_image_coherence"
+    FAIR_REPRESENTATION = "fair_representation"
+
+
+@dataclass(frozen=True)
+class Rubric:
+    definition: str
+    note: str
+
+
+RUBRIC: dict[QualityProperty, Rubric] = {
+    QualityProperty.FUNCTIONAL_RELEVANCE: Rubric(
+        definition=(
+            "functional_relevance evaluates if an image provides information directly relevant to answering a question, either by being essential for the answer or by significantly aiding comprehension. The image's purpose should be to assist in answering the question, not merely to serve as a decorative element."
+        ),
+        note="The image should help to answer the question, not just to decorate it.",
+    ),
+    QualityProperty.VISUAL_CLARITY: Rubric(
+        definition=(
+            "visual_clarity evaluates the directness of the image in representing only what is needed to answer the question, without unnecessary clutter, decorations, or competing elements that could distract from the main content. Important items should be clearly identifiable to reduce the mental effort needed for visual search. "
+        ),
+        note=("The image should be focused and free from visual distractions."),
+    ),
+    QualityProperty.TECHNICAL_QUALITY: Rubric(
+        definition=(
+            "technical_quality measures whether an image has sufficient resolution, contrast, and legibility for all important elements (including any text, labels, or fine details) to be easily perceived. Poor technical quality can create construct-irrelevant difficulty."
+        ),
+        note=(
+            "The image should be sharp, clear, and easy to see."
+            "The text, if present, should be readable."
+            "The details, id present, should be visible without straining. "
+        ),
+    ),
+    QualityProperty.STANDARD_PRESENTATION: Rubric(
+        definition=(
+            "standard_presentation considers whether images and their elements appear in expected orientations and follow conventional representations familiar to the test population. Non-standard orientations can add construct-irrelevant cognitive load by requiring mental rotation."
+        ),
+        note=(
+            "Images should be presented in the orientation that is conventional for the subject."
+            "Unusual rotations or mirroring require extra mental effort."
+        ),
+    ),
+    QualityProperty.TEXT_IMAGE_COHERENCE: Rubric(
+        definition=(
+            "text_image_coherence assesses whether the image and text components of a question convey consistent information without contradictions or unnecessary spatial separation. Misalignment can alter the interpretation of the question or create a split-attention effect."
+        ),
+        note=(
+            "The image and the corresponding text should not contain contradictory information."
+        ),
+    ),
+    QualityProperty.FAIR_REPRESENTATION: Rubric(
+        definition=(
+            "fair_representation evaluates whether an image is free of bias, "
+            "stereotyping, and unfair treatment of any group. The image FAILS "
+            "this property if it shows ANY of the following:\n"
+            "1. Culturally insensitive or offensive depictions.\n"
+            "2. Exaggerated stereotypes in clothing, skin tone, setting, or facial features.\n"
+            "3. Objects or symbols carrying implicit bias or discriminatory connotations.\n"
+            "4. Stereotypes or caricatures that distort a group's characteristics.\n"
+            "5. Settings where certain groups are systematically excluded or marginalized.\n"
+            "6. Certain groups or perspectives underrepresented.\n"
+            "7. Diversity portrayed inaccurately, or cultures/identities misrepresented.\n"
+            "8. Human experiences flattened or oversimplified, ignoring marginalized groups.\n"
+            "9. Negative traits (crime, poverty, danger) associated with a specific group.\n"
+            "10. Content with potential to cause harm or reinforce prejudice.\n"
+            "11. Unfair or unjust treatment of any depicted individual or group.\n"
+            "12. Inappropriate or stereotypical sexualization of individuals.\n"
+            "13. Misleading or manipulated content that reinforces bias.\n"
+            "14. Visual marginalization through unequal lighting or off-center composition.\n"
+            "15. Visual style that trivializes or demeans a serious identity or subject.\n"
+            "16. Exaggerated or mocking features that ridicule a group or individual.\n"
+            "17. Unbalanced power dynamics, such as dominance or subordination.\n"
+            "18. Outdated, colonial, or exoticizing stereotypes.\n"
+            "19. Degradation or dehumanization based on race, gender, ethnicity, "
+            "religion, or socioeconomic status.\n\n"
+            "If NONE of the above apply, the image passes."
+        ),
+        note=(
+            "Check the image against every item above. A single match is enough "
+            "to fail the property — the checks are not averaged or weighted."
+        ),
+    ),
+}
+
+# Makes the definitions read-only
+RUBRIC = MappingProxyType(RUBRIC)
+
+
+# Lookup properties
+def rubric_for(prop: QualityProperty) -> Rubric:
+    return RUBRIC[prop]
+
+# ===== domain/verdict.py =====
+"""
+verdict.py: This file creates a Pydantic schema to handle the format of the model's response.
+"""
+
+from pydantic import BaseModel, ConfigDict, model_validator
+from typing_extensions import Self
+from domain.properties import QualityProperty
+from domain.errors import VerdictError
+
+
+class Verdict(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    property: QualityProperty
+    passed: bool
+    reasoning: str
+
+    @model_validator(mode="after")
+    def check_reasoning_matches_verdict(self) -> Self:
+        """
+        The reasoning should only be provided if the verdict returns passed=False.
+        """
+        if self.passed and len(self.reasoning) > 0:
+            raise VerdictError(
+                "The reasoning should only be provided if a trait did not pass."
+            )
+        if not self.passed and len(self.reasoning) == 0:
+            raise VerdictError(
+                "The reasoning can't be empty if the trait did not pass."
+            )
+        return self
+
+# ===== dump_codebase.py =====
+"""
+dump_codebase.py: walks a project folder, finds every .py file, and
+concatenates them into one big .txt file, each preceded by its folder
+path as a comment. Use this to hand a whole codebase to Claude at once.
+
+Usage:
+    uv run python dump_codebase.py
+    uv run python dump_codebase.py --root . --output codebase_dump.txt
+"""
+
+import argparse
+from pathlib import Path
+
+# Folders never worth including: virtual envs, caches, git internals,
+# and generated data/results (large, and not code).
+EXCLUDED_DIR_NAMES = {
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".git",
+    ".pytest_cache",
+    "node_modules",
+    "runs",
+    "data",
+    ".mypy_cache",
+    "egg-info",
+}
+
+
+def should_skip(path: Path) -> bool:
+    """
+    True if any part of this path's folders matches an excluded name.
+    """
+    return any(part in EXCLUDED_DIR_NAMES for part in path.parts)
+
+
+def dump_codebase(root: Path, output_path: Path) -> None:
+    python_files = sorted(
+        p for p in root.rglob("*.py") if not should_skip(p.relative_to(root))
+    )
+
+    with open(output_path, "w", encoding="utf-8") as out:
+        for file_path in python_files:
+            relative_path = file_path.relative_to(root)
+
+            # Folder path as a comment, right before the file's own content.
+            out.write(f"# ===== {relative_path} =====\n")
+
+            content = file_path.read_text(encoding="utf-8")
+            out.write(content)
+
+            if not content.endswith("\n"):
+                out.write("\n")
+            out.write("\n")
+
+    print(f"Wrote {len(python_files)} files to {output_path}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=Path("."),
+        help="Project root to search from (default: current directory).",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("codebase_dump.txt"),
+        help="Output file path (default: codebase_dump.txt).",
+    )
+    args = parser.parse_args()
+
+    dump_codebase(args.root, args.output)
+
+# ===== evaluation/collateral_fp_analysis.py =====
+"""
+collateral_fp_analysis.py
+
+Analyzes "collateral" false positives: cases where a mutation targeted ONE
+property, but the judge model also flagged a DIFFERENT, untouched property
+as failed.
+
+Only considers results where strategy == "combined".
+Produces separate tables for gpt5.6-luna and gpt5.6-terra.
+
+Usage:
+    uv run python collateral_fp_analysis.py /path/to/results/folder
+"""
+
+import json
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+TARGET_MODELS = ["gpt5.6-luna", "gpt5.6-terra"]
+
+ALL_PROPERTIES = [
+    "functional_relevance",
+    "visual_clarity",
+    "technical_quality",
+    "standard_presentation",
+    "text_image_coherence",
+    "fair_representation",
+]
+
+
+def load_results(results_dir: Path) -> list[dict]:
+    """
+    Reads every .json file in results_dir. Skips files that fail to parse,
+    printing a warning instead of crashing the whole run.
+    """
+    results = []
+    for path in results_dir.glob("*.json"):
+        try:
+            with open(path) as f:
+                results.append(json.load(f))
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"Warning: skipped unreadable file {path.name}: {e}")
+    return results
+
+
+def build_collateral_counts(results: list[dict], model: str) -> tuple[dict, dict]:
+    """
+    Returns two nested dicts, both keyed [mutation_type][property]:
+    - fp_counts: number of times 'property' was wrongly flagged failed
+    - total_counts: number of times 'property' was eligible to be counted
+      (i.e. it wasn't the mutated property itself)
+    """
+    fp_counts = defaultdict(lambda: defaultdict(int))
+    total_counts = defaultdict(lambda: defaultdict(int))
+
+    for row in results:
+        if row.get("strategy") != "combined":
+            continue
+        if row.get("model") != model:
+            continue
+
+        mutation_type = row.get("mutation_type")
+        if mutation_type not in ALL_PROPERTIES:
+            # unexpected/unknown mutation_type - skip rather than guess
+            continue
+
+        for verdict in row.get("verdicts", []):
+            prop = verdict.get("property")
+            if prop == mutation_type:
+                # this is the property that was deliberately damaged,
+                # not a collateral case
+                continue
+            if prop not in ALL_PROPERTIES:
+                continue
+
+            total_counts[mutation_type][prop] += 1
+            if verdict.get("passed") is False:
+                fp_counts[mutation_type][prop] += 1
+
+    return fp_counts, total_counts
+
+
+def print_table(model: str, fp_counts: dict, total_counts: dict) -> None:
+    other_properties_header = ALL_PROPERTIES
+    print(f"\n{'=' * 80}")
+    print(f"Model: {model}")
+    print(f"{'=' * 80}")
+
+    header = f"{'mutation_type':<24}" + "".join(
+        f"{p:<26}" for p in other_properties_header
+    )
+    print(header)
+
+    for mutation_type in ALL_PROPERTIES:
+        row_cells = []
+        for prop in other_properties_header:
+            if prop == mutation_type:
+                row_cells.append(f"{'-- (mutated) --':<26}")
+                continue
+            fp = fp_counts[mutation_type].get(prop, 0)
+            total = total_counts[mutation_type].get(prop, 0)
+            pct = (fp / total * 100) if total > 0 else 0.0
+            cell = f"{fp}/{total} ({pct:.1f}%)"
+            row_cells.append(f"{cell:<26}")
+        print(f"{mutation_type:<24}" + "".join(row_cells))
+
+
+def write_csv(model: str, fp_counts: dict, total_counts: dict, out_path: Path) -> None:
+    lines = ["mutation_type,property,fp_count,total_count,fp_percentage"]
+    for mutation_type in ALL_PROPERTIES:
+        for prop in ALL_PROPERTIES:
+            if prop == mutation_type:
+                continue
+            fp = fp_counts[mutation_type].get(prop, 0)
+            total = total_counts[mutation_type].get(prop, 0)
+            pct = (fp / total * 100) if total > 0 else 0.0
+            lines.append(f"{mutation_type},{prop},{fp},{total},{pct:.2f}")
+
+    out_path.write_text("\n".join(lines))
+    print(f"\nWrote {out_path}")
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: uv run python collateral_fp_analysis.py /path/to/results")
+        sys.exit(1)
+
+    results_dir = Path(sys.argv[1])
+    if not results_dir.is_dir():
+        print(f"Not a directory: {results_dir}")
+        sys.exit(1)
+
+    print(f"Loading result files from {results_dir} ...")
+    results = load_results(results_dir)
+    print(f"Loaded {len(results)} result files total.")
+
+    for model in TARGET_MODELS:
+        fp_counts, total_counts = build_collateral_counts(results, model)
+        print_table(model, fp_counts, total_counts)
+
+        csv_name = f"collateral_fp_{model.replace('.', '_')}.csv"
+        write_csv(model, fp_counts, total_counts, Path(csv_name))
+
+
+if __name__ == "__main__":
+    main()
+
+# ===== evaluation/curves.py =====
+"""
+curves.py: computes detection rate by severity — the main result showing
+whether models catch more obvious damage more reliably.
+"""
+
+from evaluation.load import LoadedResult
+from evaluation.metrics import compute_confusion_counts, compute_metrics
+from domain.properties import QualityProperty
+
+
+def detection_rate_by_severity(results: list[LoadedResult]) -> dict[str, dict]:
+    """
+    Groups results by severity, computes aggregate precision/recall/F1 for each.
+    """
+    grouped = {}
+    for result in results:
+        severity = result.severity
+        if severity not in grouped:
+            grouped[severity] = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+
+        damaged_property = QualityProperty(result.mutation_type)
+
+        counts = compute_confusion_counts(result.verdicts, damaged_property)
+        grouped[severity]["tp"] += counts["tp"]
+        grouped[severity]["fp"] += counts["fp"]
+        grouped[severity]["fn"] += counts["fn"]
+        grouped[severity]["tn"] += counts["tn"]
+
+    final_result = {}
+    for severity, counts in grouped.items():
+        final_result[severity] = compute_metrics(counts)
+
+    return final_result
+
+
+def detection_rate_by(
+    results: list[LoadedResult], group_by: list[str]
+) -> dict[tuple, dict]:
+    """
+    Groups results by any combination of fields (e.g. ["strategy", "severity"]),
+    computes aggregate precision/recall/F1 for each group.
+    """
+    grouped = {}
+
+    for result in results:
+        key = tuple(getattr(result, field) for field in group_by)
+
+        if key not in grouped:
+            grouped[key] = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+
+        damaged_property = QualityProperty(result.mutation_type)
+        counts = compute_confusion_counts(result.verdicts, damaged_property)
+
+        for k in grouped[key]:
+            grouped[key][k] += counts[k]
+
+    return {key: compute_metrics(counts) for key, counts in grouped.items()}
+
+
+def total_cost_by_strategy(results: list) -> dict[str, float]:
+    """
+    Sums total cost, grouped by strategy.
+    """
+    totals = {}
+    for result in results:
+        totals[result.strategy] = totals.get(result.strategy, 0.0) + result.cost
+    return totals
+
+# ===== evaluation/figures.py =====
+"""
+figures.py: generates the main severity-detection chart.
+"""
+
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+
+def plot_detection_by_severity(
+    detection_rates: dict[str, dict], output_path: Path
+) -> None:
+    """
+    Plots recall by severity level (subtle -> moderate -> obvious), saves as PNG.
+    """
+    severity_order = ["subtle", "moderate", "obvious"]
+    available = [s for s in severity_order if s in detection_rates]
+    recalls = [detection_rates[s]["recall"] for s in available]
+
+    plt.style.use("seaborn-v0_8-whitegrid")
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+
+    ax.plot(
+        available,
+        recalls,
+        marker="o",
+        markersize=9,
+        linewidth=2.5,
+        color="#2E5C8A",
+        markerfacecolor="#2E5C8A",
+        markeredgecolor="white",
+        markeredgewidth=1.5,
+        zorder=3,
+    )
+
+    ax.fill_between(available, recalls, alpha=0.08, color="#2E5C8A", zorder=1)
+
+    for x, y in zip(available, recalls):
+        ax.annotate(
+            f"{y:.2f}",
+            (x, y),
+            textcoords="offset points",
+            xytext=(0, 12),
+            ha="center",
+            fontsize=10,
+            fontweight="bold",
+            color="#2E5C8A",
+        )
+
+    ax.set_ylim(0, 1.08)
+    ax.set_xlabel("Damage Severity", fontsize=11, labelpad=10)
+    ax.set_ylabel("Detection Recall", fontsize=11, labelpad=10)
+    ax.set_title(
+        "Detection Rate by Damage Severity", fontsize=13, fontweight="bold", pad=15
+    )
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.tick_params(labelsize=10)
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+# ===== evaluation/generate_full_summary.py =====
+"""
+generate_full_summary.py: computes and saves the complete analysis across
+both Phase 1 and Phase 2 — detection rates, cost, significance, and
+model comparison.
+"""
+
+import json
+from pathlib import Path
+
+from evaluation.load import load_results
+from evaluation.curves import detection_rate_by, total_cost_by_strategy
+from evaluation.tables import (
+    strategy_severity_table_latex,
+    two_dimension_table_latex,
+    save_table,
+    cost_summary_table_latex,
+)
+from evaluation.figures import plot_detection_by_severity
+from evaluation.significance import mcnemar_test, bootstrap_recall_ci
+
+results = load_results(Path("runs/results"))
+print(f"Total results (before filtering): {len(results)}")
+
+REAL_MODELS = {"gpt5.6-luna", "gpt5.6-terra"}
+results = [r for r in results if r.model in REAL_MODELS]
+print(f"Total results (after filtering test contamination): {len(results)}")
+
+by_strategy_severity = detection_rate_by(results, group_by=["strategy", "severity"])
+by_strategy_property = detection_rate_by(
+    results, group_by=["strategy", "mutation_type"]
+)
+by_model_severity = detection_rate_by(results, group_by=["model", "severity"])
+by_model_property = detection_rate_by(results, group_by=["model", "mutation_type"])
+
+cost_by_strategy = total_cost_by_strategy(results)
+cost_by_model = {}
+for r in results:
+    cost_by_model[r.model] = cost_by_model.get(r.model, 0.0) + r.cost
+
+split_results = [r for r in results if r.strategy == "split"]
+combined_results = [r for r in results if r.strategy == "combined"]
+mcnemar_result = mcnemar_test(split_results, combined_results)
+split_ci = bootstrap_recall_ci(split_results, n_bootstrap=1000)
+combined_ci = bootstrap_recall_ci(combined_results, n_bootstrap=1000)
+
+summary = {
+    "total_results": len(results),
+    "detection_by_strategy_severity": {
+        str(k): v for k, v in by_strategy_severity.items()
+    },
+    "detection_by_strategy_property": {
+        str(k): v for k, v in by_strategy_property.items()
+    },
+    "detection_by_model_severity": {str(k): v for k, v in by_model_severity.items()},
+    "detection_by_model_property": {str(k): v for k, v in by_model_property.items()},
+    "cost_by_strategy": cost_by_strategy,
+    "cost_by_model": cost_by_model,
+    "mcnemar_test": mcnemar_result,
+    "bootstrap_recall_ci": {"split": split_ci, "combined": combined_ci},
+}
+
+output_dir = Path("runs/full_summary")
+output_dir.mkdir(parents=True, exist_ok=True)
+with open(output_dir / "summary.json", "w") as f:
+    json.dump(summary, f, indent=2)
+
+# --- tables ---
+save_table(
+    strategy_severity_table_latex(by_strategy_severity),
+    output_dir / "strategy_severity.tex",
+)
+save_table(
+    two_dimension_table_latex(
+        by_model_severity,
+        "Model",
+        "Severity",
+        ["gpt5.6-luna", "gpt5.6-terra"],
+        ["subtle", "moderate", "obvious"],
+        "Detection performance by model and damage severity.",
+        "tab:model-severity",
+    ),
+    output_dir / "model_severity.tex",
+)
+save_table(
+    cost_summary_table_latex(cost_by_model, len(results)),
+    output_dir / "cost_summary.tex",
+)
+save_table(
+    two_dimension_table_latex(
+        by_model_property,
+        "Model",
+        "Property",
+        ["gpt5.6-luna", "gpt5.6-terra"],
+        [
+            "technical_quality",
+            "visual_clarity",
+            "standard_presentation",
+            "functional_relevance",
+            "text_image_coherence",
+        ],
+        "Detection performance by model and evaluated property.",
+        "tab:model-property",
+    ),
+    output_dir / "model_property.tex",
+)
+
+# --- figure: overall detection by severity, combined strategy only ---
+combined_by_severity = {
+    sev: metrics
+    for (strat, sev), metrics in by_strategy_severity.items()
+    if strat == "combined"
+}
+plot_detection_by_severity(
+    combined_by_severity, output_dir / "detection_by_severity.png"
+)
+
+print(f"Saved everything to {output_dir}/")
+
+
+# TODO: check which traits have been affected collaterally
+
+# ===== evaluation/generate_phase1_summary.py =====
+"""
+generate_phase1_summary.py: computes and saves the complete Phase 1
+analysis — detection rates, cost comparison, and significance tests.
+"""
+
+import json
+from pathlib import Path
+
+from evaluation.load import load_results
+from evaluation.curves import detection_rate_by, total_cost_by_strategy
+from evaluation.tables import strategy_severity_table_latex, save_table
+from evaluation.significance import mcnemar_test, bootstrap_recall_ci
+
+results = load_results(Path("runs/results"))
+
+# detection rates
+by_severity = detection_rate_by(results, group_by=["strategy", "severity"])
+by_property = detection_rate_by(results, group_by=["strategy", "mutation_type"])
+
+# cost
+costs = total_cost_by_strategy(results)
+split_scaled = costs["split"] * 6
+combined_total = costs["combined"]
+
+# significance
+split_results = [r for r in results if r.strategy == "split"]
+combined_results = [r for r in results if r.strategy == "combined"]
+mcnemar_result = mcnemar_test(split_results, combined_results)
+split_ci = bootstrap_recall_ci(split_results, n_bootstrap=1000)
+combined_ci = bootstrap_recall_ci(combined_results, n_bootstrap=1000)
+
+summary = {
+    "detection_by_strategy_severity": {str(k): v for k, v in by_severity.items()},
+    "detection_by_strategy_property": {str(k): v for k, v in by_property.items()},
+    "cost": {
+        "split_raw": costs["split"],
+        "split_scaled_to_6x_coverage": split_scaled,
+        "combined": combined_total,
+    },
+    "mcnemar_test": mcnemar_result,
+    "bootstrap_recall_ci": {
+        "split": split_ci,
+        "combined": combined_ci,
+    },
+}
+
+output_dir = Path("runs/phase1_summary")
+output_dir.mkdir(parents=True, exist_ok=True)
+
+with open(output_dir / "summary.json", "w") as f:
+    json.dump(summary, f, indent=2)
+
+latex = strategy_severity_table_latex(by_severity)
+save_table(latex, output_dir / "strategy_severity.tex")
+
+print(f"Saved summary to {output_dir}")
+
+# ===== evaluation/load.py =====
+"""
+load.py: reads saved run results from disk, into a form metrics.py can use.
+"""
+
+import json
+from pathlib import Path
+from dataclasses import dataclass
+
+from domain.verdict import Verdict
+
+
+@dataclass(frozen=True)
+class LoadedResult:
+    item_id: str
+    mutation_type: str
+    severity: str
+    model: str
+    strategy: str
+    verdicts: list[Verdict]
+    cost: float
+    input_tokens: int
+    output_tokens: int
+
+
+def load_results(results_dir: Path) -> list[LoadedResult]:
+    """
+    Reads every saved result JSON file in results_dir, returns them as
+    a list of LoadedResult objects.
+    """
+    results = []
+    for file in results_dir.glob("*.json"):
+        with open(file) as f:
+            data = json.load(f)
+            verdict_list = [Verdict(**v) for v in data["verdicts"]]
+            result = LoadedResult(
+                data["item_id"],
+                data["mutation_type"],
+                data["severity"],
+                data["model"],
+                data["strategy"],
+                verdict_list,
+                data["cost"],
+                data["input_tokens"],
+                data["output_tokens"],
+            )
+            results.append(result)
+    return results
+
+# ===== evaluation/metrics.py =====
+"""
+metrics.py: precision, recall, F1 for damage detection.
+"""
+
+from domain.verdict import Verdict
+from domain.properties import QualityProperty
+
+
+def compute_confusion_counts(
+    verdicts: list[Verdict], damaged_property: QualityProperty
+) -> dict:
+    """
+    Compares model verdicts against ground truth (damaged_property should be
+    passed=False, everything else should be passed=True).
+    """
+    tp = fp = fn = tn = 0
+
+    for verdict in verdicts:
+        is_damaged = verdict.property == damaged_property
+        model_flagged_failure = not verdict.passed
+
+        # your turn: based on is_damaged and model_flagged_failure,
+        # increment the right counter
+        if is_damaged and model_flagged_failure:
+            tp += 1
+        elif is_damaged and not model_flagged_failure:
+            fn += 1
+        elif not is_damaged and model_flagged_failure:
+            fp += 1
+        elif not is_damaged and not model_flagged_failure:
+            tn += 1
+
+    return {"tp": tp, "fp": fp, "fn": fn, "tn": tn}
+
+
+def compute_metrics(counts: dict) -> dict:
+    """
+    Computes precision, recall, and F1 from TP/FP/FN counts.
+    """
+    tp = counts["tp"]
+    fp = counts["fp"]
+    fn = counts["fn"]
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = (
+        2 * (precision * recall) / (precision + recall)
+        if (precision + recall) > 0
+        else 0.0
+    )
+
+    metrics = {"precision": precision, "recall": recall, "f1": f1}
+    return metrics
+
+# ===== evaluation/significance.py =====
+"""
+significance.py: statistical tests for comparing two strategies/models on
+the same data — McNemar's test for paired detection comparisons, and
+bootstrap confidence intervals for a single strategy's recall.
+"""
+
+import random
+from statsmodels.stats.contingency_tables import mcnemar
+
+from evaluation.load import LoadedResult
+from evaluation.metrics import compute_confusion_counts, compute_metrics
+from domain.properties import QualityProperty
+
+
+def did_catch_damage(result: LoadedResult) -> bool:
+    """
+    True if the model correctly flagged the actually-damaged property as failed.
+    If the damaged property doesn't appear in the verdicts at all (a malformed
+    or incomplete response), this counts as NOT caught — a missed detection,
+    not a silent pass.
+    """
+    damaged_property = QualityProperty(result.mutation_type)
+    for verdict in result.verdicts:
+        if verdict.property == damaged_property:
+            return not verdict.passed
+    return False
+
+
+def match_paired_results(
+    results_a: list[LoadedResult], results_b: list[LoadedResult]
+) -> list[tuple[LoadedResult, LoadedResult]]:
+    """
+    Pairs up results from two strategies/models that evaluated the SAME
+    underlying unit of work (same item, mutation, severity) — required for
+    a valid paired comparison. Results that only exist on one side are dropped.
+    """
+
+    def key(r: LoadedResult):
+        return (r.item_id, r.mutation_type, r.severity)
+
+    lookup_b = {key(r): r for r in results_b}
+
+    pairs = []
+    for result_a in results_a:
+        result_b = lookup_b.get(key(result_a))
+        if result_b is not None:
+            pairs.append((result_a, result_b))
+    return pairs
+
+
+def mcnemar_test(results_a: list[LoadedResult], results_b: list[LoadedResult]) -> dict:
+    """
+    Runs McNemar's test comparing detection rates between two strategies/models,
+    on the same underlying items.
+    """
+    pairs = match_paired_results(results_a, results_b)
+
+    b = 0  # A caught it, B missed it
+    c = 0  # B caught it, A missed it
+
+    for result_a, result_b in pairs:
+        caught_a = did_catch_damage(result_a)
+        caught_b = did_catch_damage(result_b)
+
+        if caught_a and not caught_b:
+            b += 1
+        elif caught_b and not caught_a:
+            c += 1
+
+    table = [[0, b], [c, 0]]
+    use_exact = (b + c) < 25
+    test_result = mcnemar(table, exact=use_exact, correction=True)
+
+    return {
+        "b": b,
+        "c": c,
+        "n_pairs": len(pairs),
+        "statistic": test_result.statistic,
+        "p_value": test_result.pvalue,
+    }
+
+
+def bootstrap_recall_ci(
+    results: list[LoadedResult],
+    n_bootstrap: int = 1000,
+    confidence: float = 0.95,
+    seed: int = 42,
+) -> dict:
+    """
+    Estimates a confidence interval for the overall recall of `results`,
+    by resampling with replacement many times and seeing how much the
+    recall varies across resamples.
+    """
+    rng = random.Random(seed)
+    n = len(results)
+
+    point_counts = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+    for result in results:
+        damaged_property = QualityProperty(result.mutation_type)
+        counts = compute_confusion_counts(result.verdicts, damaged_property)
+        for key in point_counts:
+            point_counts[key] += counts[key]
+    point_estimate = compute_metrics(point_counts)["recall"]
+
+    bootstrap_recalls = []
+    for _ in range(n_bootstrap):
+        resample = [rng.choice(results) for _ in range(n)]
+
+        counts = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+        for result in resample:
+            damaged_property = QualityProperty(result.mutation_type)
+            result_counts = compute_confusion_counts(result.verdicts, damaged_property)
+            for key in counts:
+                counts[key] += result_counts[key]
+
+        bootstrap_recalls.append(compute_metrics(counts)["recall"])
+
+    bootstrap_recalls.sort()
+    lower_idx = int((1 - confidence) / 2 * n_bootstrap)
+    upper_idx = int((1 + confidence) / 2 * n_bootstrap) - 1
+
+    return {
+        "point_estimate": point_estimate,
+        "lower": bootstrap_recalls[lower_idx],
+        "upper": bootstrap_recalls[upper_idx],
+        "confidence": confidence,
+    }
+
+# ===== evaluation/tables.py =====
+"""
+tables.py: generates LaTeX tables from computed metrics, for direct
+inclusion in the paper.
+"""
+
+from pathlib import Path
+
+
+def detection_rate_table_latex(detection_rates: dict[str, dict]) -> str:
+    """
+    Builds a LaTeX table (using the booktabs style) showing precision,
+    recall, and F1 for each severity level.
+    """
+    severity_order = ["subtle", "moderate", "obvious"]
+    available = [s for s in severity_order if s in detection_rates]
+
+    lines = []
+    lines.append(r"\begin{table}[h]")
+    lines.append(r"\centering")
+    lines.append(r"\begin{tabular}{lccc}")
+    lines.append(r"\toprule")
+    lines.append(r"Severity & Precision & Recall & F1 \\")
+    lines.append(r"\midrule")
+
+    for severity in available:
+        metrics = detection_rates[severity]
+        lines.append(
+            f"{severity.capitalize()} & "
+            f"{metrics['precision']:.2f} & "
+            f"{metrics['recall']:.2f} & "
+            f"{metrics['f1']:.2f} \\\\"
+        )
+
+    lines.append(r"\bottomrule")
+    lines.append(r"\end{tabular}")
+    lines.append(r"\caption{Detection performance by damage severity.}")
+    lines.append(r"\label{tab:detection-by-severity}")
+    lines.append(r"\end{table}")
+
+    return "\n".join(lines)
+
+
+def save_table(latex_string: str, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(latex_string)
+
+
+def strategy_severity_table_latex(breakdown: dict[tuple, dict]) -> str:
+    """
+    Builds a LaTeX table from a (strategy, severity)-keyed breakdown,
+    as produced by detection_rate_by(results, group_by=["strategy", "severity"]).
+    """
+    severity_order = ["subtle", "moderate", "obvious"]
+    strategy_order = ["split", "combined"]
+
+    lines = []
+    lines.append(r"\begin{table}[h]")
+    lines.append(r"\centering")
+    lines.append(r"\begin{tabular}{llccc}")
+    lines.append(r"\toprule")
+    lines.append(r"Strategy & Severity & Precision & Recall & F1 \\")
+    lines.append(r"\midrule")
+
+    for strategy in strategy_order:
+        for severity in severity_order:
+            key = (strategy, severity)
+            if key not in breakdown:
+                continue
+            metrics = breakdown[key]
+            lines.append(
+                f"{strategy.capitalize()} & {severity.capitalize()} & "
+                f"{metrics['precision']:.2f} & "
+                f"{metrics['recall']:.2f} & "
+                f"{metrics['f1']:.2f} \\\\"
+            )
+        lines.append(r"\midrule")
+
+    lines.pop()  # remove the trailing \midrule after the last group
+    lines.append(r"\bottomrule")
+    lines.append(r"\end{tabular}")
+    lines.append(
+        r"\caption{Detection performance by prompting strategy and damage severity.}"
+    )
+    lines.append(r"\label{tab:strategy-severity}")
+    lines.append(r"\end{table}")
+
+    return "\n".join(lines)
+
+
+def two_dimension_table_latex(
+    breakdown: dict[tuple, dict],
+    col1_name: str,
+    col2_name: str,
+    col1_order: list[str],
+    col2_order: list[str],
+    caption: str,
+    label: str,
+) -> str:
+    """
+    Builds a LaTeX table from any two-dimension breakdown (e.g. model x severity).
+    """
+    lines = []
+    lines.append(r"\begin{table}[h]")
+    lines.append(r"\centering")
+    lines.append(r"\begin{tabular}{llccc}")
+    lines.append(r"\toprule")
+    lines.append(f"{col1_name} & {col2_name} & Precision & Recall & F1 \\\\")
+    lines.append(r"\midrule")
+
+    for c1 in col1_order:
+        for c2 in col2_order:
+            key = (c1, c2)
+            if key not in breakdown:
+                continue
+            m = breakdown[key]
+            lines.append(
+                f"{c1} & {c2.capitalize()} & {m['precision']:.2f} & {m['recall']:.2f} & {m['f1']:.2f} \\\\"
+            )
+        lines.append(r"\midrule")
+
+    lines.pop()
+    lines.append(r"\bottomrule")
+    lines.append(r"\end{tabular}")
+    lines.append(f"\\caption{{{caption}}}")
+    lines.append(f"\\label{{{label}}}")
+    lines.append(r"\end{table}")
+
+    return "\n".join(lines)
+
+
+def collateral_fp_table_latex(
+    fp_counts: dict,
+    total_counts: dict,
+    model_name: str,
+    properties: list[str],
+) -> str:
+    """
+    Builds a LaTeX table showing collateral false-positive rates: for each
+    mutated property (rows), the percentage of the time each OTHER property
+    (columns) was wrongly flagged as failed.
+
+    fp_counts and total_counts are nested dicts keyed [mutation_type][property],
+    as produced by collateral_fp_analysis.build_collateral_counts. The diagonal
+    (mutation_type == property) is not applicable and is rendered as "--".
+    """
+    column_spec = "l" + "c" * len(properties)
+    header_cells = " & ".join(p.replace("_", " ").title() for p in properties)
+
+    lines = []
+    lines.append(r"\begin{table}[h]")
+    lines.append(r"\centering")
+    lines.append(r"\small")
+    lines.append(f"\\begin{{tabular}}{{{column_spec}}}")
+    lines.append(r"\toprule")
+    lines.append(f"Mutated property & {header_cells} \\\\")
+    lines.append(r"\midrule")
+
+    for mutation_type in properties:
+        row_cells = []
+        for prop in properties:
+            if prop == mutation_type:
+                row_cells.append("--")
+                continue
+            fp = fp_counts.get(mutation_type, {}).get(prop, 0)
+            total = total_counts.get(mutation_type, {}).get(prop, 0)
+            pct = (fp / total * 100) if total > 0 else 0.0
+            row_cells.append(f"{pct:.1f}\\%")
+        row_label = mutation_type.replace("_", " ").title()
+        lines.append(f"{row_label} & " + " & ".join(row_cells) + r" \\")
+
+    lines.append(r"\bottomrule")
+    lines.append(r"\end{tabular}")
+    lines.append(
+        f"\\caption{{Collateral false-positive rate by mutated property "
+        f"({model_name}). Each cell shows how often the column property "
+        f"was wrongly flagged as failed when the row property was the one "
+        f"actually mutated.}}"
+    )
+    lines.append(f"\\label{{tab:collateral-fp-{model_name.replace('.', '-')}}}")
+    lines.append(r"\end{table}")
+
+    return "\n".join(lines)
+
+
+def cost_summary_table_latex(
+    cost_by_model: dict[str, float], total_results: int
+) -> str:
+    """
+    Builds a LaTeX table summarizing total cost per model and the total
+    number of results processed.
+    """
+    lines = []
+    lines.append(r"\begin{table}[h]")
+    lines.append(r"\centering")
+    lines.append(r"\begin{tabular}{lr}")
+    lines.append(r"\toprule")
+    lines.append(r"Model & Total cost (\$) \\")
+    lines.append(r"\midrule")
+
+    for model, cost in cost_by_model.items():
+        lines.append(f"{model} & {cost:.2f} \\\\")
+
+    total_cost = sum(cost_by_model.values())
+    lines.append(r"\midrule")
+    lines.append(f"Total & {total_cost:.2f} \\\\")
+    lines.append(r"\bottomrule")
+    lines.append(r"\end{tabular}")
+    lines.append(
+        f"\\caption{{Total cost by model, and total items processed: {total_results}.}}"
+    )
+    lines.append(r"\label{tab:cost-summary}")
+    lines.append(r"\end{table}")
+
+    return "\n".join(lines)
+
+# ===== execution/batch.py =====
+"""
+batch.py: splits a list of PromptRequests into properly-sized chunks
+for submission, respecting provider request-count limits.
+"""
+
+from providers.base import PromptRequest
+
+
+def chunk_requests(
+    requests: list[PromptRequest], max_per_batch: int
+) -> list[list[PromptRequest]]:
+    """
+    Splits requests into groups of at most max_per_batch each.
+    """
+    chunks = []
+    for i in range(0, len(requests), max_per_batch):
+        chunk = requests[i : i + max_per_batch]
+        chunks.append(chunk)
+    return chunks
+
+# ===== execution/cache.py =====
+"""
+cache.py: tracks which fingerprints have already been completed,
+enabling crash-safe resume without duplicate API calls.
+"""
+
+from pathlib import Path
+
+
+class Cache:
+    def __init__(self, cache_path: Path):
+        self.cache_path = cache_path
+        self.completed: set[str] = set()
+        if self.cache_path.exists():
+            with open(self.cache_path) as f:
+                for line in f:
+                    self.completed.add(line.strip())
+
+    def is_done(self, fingerprint: str) -> bool:
+        return fingerprint in self.completed
+
+    def mark_done(self, fingerprint: str) -> None:
+        if fingerprint in self.completed:
+            return
+        self.completed.add(fingerprint)
+        with open(self.cache_path, "a") as f:
+            f.write(fingerprint + "\n")
+
+# ===== execution/ledger.py =====
+"""
+ledger.py: tracks batches that have been submitted but not yet fetched,
+so a crash while waiting doesn't lose track of paid-for, in-flight batches.
+"""
+
+from pathlib import Path
+
+
+class Ledger:
+    def __init__(self, ledger_path: Path):
+        self.ledger_path = ledger_path
+        self.pending: set[str] = set()
+        if self.ledger_path.exists():
+            with open(self.ledger_path) as f:
+                for line in f:
+                    self.pending.add(line.strip())
+
+    def add_batch(self, batch_id: str) -> None:
+        self.pending.add(batch_id)
+        with open(self.ledger_path, "a") as f:
+            f.write(batch_id + "\n")
+
+    def remove_batch(self, batch_id: str) -> None:
+        self.pending.remove(batch_id)
+        with open(self.ledger_path, "w") as f:
+            for pending_id in self.pending:
+                f.write(pending_id + "\n")
+
+    def get_pending(self) -> set[str]:
+        return self.pending
+
+# ===== execution/manifest.py =====
+"""
+manifest.py: records the settings that produced a run's results,
+and prevents accidentally reusing a folder with different settings.
+"""
+
+import json
+import subprocess
+from pathlib import Path
+from dataclasses import dataclass, asdict
+
+
+class RunConfigDrift(Exception):
+    """Raised when a run folder's recorded settings don't match the current settings."""
+
+    pass
+
+
+def get_git_commit() -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"], capture_output=True, text=True
+    )
+    return result.stdout.strip()
+
+
+@dataclass(frozen=True)
+class Manifest:
+    git_commit: str
+    models: list[str]
+    seed: int
+
+
+def write_manifest(manifest: Manifest, path: Path) -> None:
+    path.write_text(json.dumps(asdict(manifest), indent=2))
+
+
+def check_manifest(manifest: Manifest, path: Path) -> None:
+    """
+    If a manifest already exists at this path, confirm it matches.
+    If it doesn't match, raise RunConfigDrift.
+    If nothing exists yet, write this one as the new record.
+    """
+    if not path.exists():
+        write_manifest(manifest, path)
+        return
+
+    existing = json.loads(path.read_text())
+    current = asdict(manifest)
+
+    if existing != current:
+        raise RunConfigDrift(
+            f"Run settings changed. Existing: {existing}, current: {current}"
+        )
+
+# ===== execution/planner.py =====
+"""
+planner.py: figures out what work remains to be done, given everything
+that should be tested and what's already been completed (via the cache).
+"""
+
+from dataclasses import dataclass
+from itertools import product
+
+from domain.item import Item
+from domain.properties import QualityProperty
+from mutations.base import MutationType, Severity
+from execution.unit import build_fingerprint
+from execution.cache import Cache
+from prompting.builder import build_prompt, hash_prompt
+
+
+@dataclass(frozen=True)
+class PlannedUnit:
+    item: Item
+    mutation_type: MutationType
+    severity: Severity
+    model: str
+    strategy: str
+
+
+def plan_work(
+    items: list[Item],
+    mutation_types: list[MutationType],
+    severities: list[Severity],
+    models: list[str],
+    strategies: list[str],
+    cache: Cache,
+    seed: int,
+) -> list[PlannedUnit]:
+    remaining = []
+
+    for item, mutation_type, model, strategy in product(
+        items, mutation_types, models, strategies
+    ):
+        if mutation_type == MutationType.FAIR_REPRESENTATION:
+            # severity doesn't change the substituted image at all, so
+            # running all 3 severities would just charge 3x for identical
+            # requests. One severity is enough - matches the SUBTLE
+            # placeholder already used inside FairRepresentationMutation.
+            severities_to_use = [Severity.SUBTLE]
+        else:
+            severities_to_use = severities
+
+        for severity in severities_to_use:
+            if strategy == "split":
+                # NOTE: relies on MutationType and QualityProperty sharing string values.
+                properties = [QualityProperty(mutation_type.value)]
+            else:
+                properties = list(QualityProperty)
+
+            prompt_text = build_prompt(item, properties)
+            prompt_hash = hash_prompt(prompt_text)
+
+            fingerprint = build_fingerprint(
+                item.id,
+                model,
+                mutation_type.value,
+                severity.value,
+                seed,
+                strategy,
+                prompt_hash,
+            )
+
+            if cache.is_done(fingerprint):
+                continue
+
+            remaining.append(
+                PlannedUnit(
+                    item=item,
+                    mutation_type=mutation_type,
+                    severity=severity,
+                    model=model,
+                    strategy=strategy,
+                )
+            )
+
+    return remaining
+
+# ===== execution/results.py =====
+"""
+results.py: saves the full result of one completed unit of work to disk —
+the source of truth for evaluation, separate from MLflow's summary mirror.
+"""
+
+import json
+from pathlib import Path
+from domain.verdict import Verdict
+
+RESULTS_DIR = Path("runs/results")
+
+
+def save_result(
+    fingerprint: str,
+    item_id: str,
+    mutation_type: str,
+    severity: str,
+    model: str,
+    strategy: str,
+    verdicts: list[Verdict],
+    cost: float,
+    input_tokens: int,
+    output_tokens: int,
+) -> None:
+    """
+    Saves one completed unit's full result as a JSON file, named by fingerprint.
+    """
+    results_dict = {
+        "item_id": item_id,
+        "mutation_type": mutation_type,
+        "severity": severity,
+        "model": model,
+        "strategy": strategy,
+        "verdicts": [v.model_dump() for v in verdicts],
+        "cost": float(cost),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    outpath = RESULTS_DIR / f"{fingerprint}.json"
+    with open(outpath, "w", encoding="utf-8") as f:
+        json.dump(results_dict, f)
+
+# ===== execution/runner.py =====
+"""
+runner.py: orchestrates the full pipeline — plans work, applies mutations,
+submits batches, polls for completion, fetches and records results.
+"""
+
+import json
+import time
+from pathlib import Path
+
+from domain.item import Item
+from domain.properties import QualityProperty
+from mutations.base import Mutation, MutationType, Severity
+from mutations.registry import get_mutation
+from providers.base import BatchProvider, PromptRequest, BatchStatus, RawResponse
+from execution.planner import plan_work, PlannedUnit
+from execution.cache import Cache
+from execution.ledger import Ledger
+from execution.unit import build_fingerprint
+from execution.batch import chunk_requests
+from prompting.builder import build_prompt, hash_prompt
+from prompting.schema import VerdictResponse
+from tracking.base import Tracker
+from tracking.pricing import calculate_cost
+from tracking.registry import get_tracker
+from tracking.summary import summarize_verdicts
+from config import ModelPricing, ModelConfig
+from execution.manifest import Manifest, get_git_commit, check_manifest
+from execution.results import save_result
+
+
+def build_mutations_by_type(
+    items: list[Item], fair_representation_candidates: list[str] | None = None
+) -> dict[MutationType, Mutation]:
+    """
+    Initializes one instance of each mutation type.
+
+    * Relevance and coherence mutations use ScienceQA items as candidates.
+    * Fair representation uses an optional external image pool.
+    * Omitting the external pool safely excludes the fair representation mutation.
+    """
+    mutations_by_type = {
+        MutationType.TECHNICAL_QUALITY: get_mutation("blur"),
+        MutationType.STANDARD_PRESENTATION: get_mutation("rotate"),
+        MutationType.VISUAL_CLARITY: get_mutation("clarity_shapes"),
+        MutationType.FUNCTIONAL_RELEVANCE: get_mutation(
+            "funct_relevance_substitution", candidates=items
+        ),
+        MutationType.TEXT_IMAGE_COHERENCE: get_mutation(
+            "coherence_substitution", candidates=items
+        ),
+    }
+
+    if fair_representation_candidates:
+        mutations_by_type[MutationType.FAIR_REPRESENTATION] = get_mutation(
+            "fair_repr_swap", candidates=fair_representation_candidates
+        )
+
+    return mutations_by_type
+
+
+def build_request_for_unit(
+    unit: PlannedUnit,
+    seed: int,
+    mutations_by_type: dict[MutationType, Mutation],
+    model_configs: dict[str, ModelConfig],
+) -> tuple[PromptRequest, str]:
+    """
+    Applies the correct mutation to get a damaged image, builds the actual
+    PromptRequest to send, plus its fingerprint (used for cache/tracking).
+    """
+    mutation = mutations_by_type[unit.mutation_type]
+    mutated_item = mutation.apply(unit.item, unit.severity, seed)
+
+    if unit.strategy == "split":
+        properties = [QualityProperty(unit.mutation_type.value)]
+    else:
+        properties = list(QualityProperty)
+
+    prompt_text = build_prompt(unit.item, properties)
+    prompt_hash = hash_prompt(prompt_text)
+
+    fingerprint = build_fingerprint(
+        unit.item.id,
+        unit.model,
+        unit.mutation_type.value,
+        unit.severity.value,
+        seed,
+        unit.strategy,
+        prompt_hash,
+    )
+
+    endpoint = model_configs[unit.model].endpoint
+
+    request = PromptRequest(
+        custom_id=fingerprint,
+        prompt=prompt_text,
+        endpoint=endpoint,
+        image_path=mutated_item.mutated_image,
+    )
+
+    return request, fingerprint
+
+
+def process_response(
+    raw_response: RawResponse,
+    unit: PlannedUnit,
+    fingerprint: str,
+    pricing: dict[str, ModelPricing],
+    tracker: Tracker,
+    cache: Cache,
+) -> None:
+    """
+    Parses one raw response, saves it, logs it to the tracker, and marks
+    its fingerprint done in the cache. Used both during a normal run and
+    during manual recovery of a batch whose original run crashed.
+    """
+    try:
+        verdicts_data = json.loads(raw_response.content)
+        verdict_response = VerdictResponse(verdicts=verdicts_data)
+    except Exception as e:
+        print(f"Failed to parse response for {fingerprint}: {e}")
+        return
+
+    model_pricing = pricing[unit.model]
+    cost = calculate_cost(
+        model_pricing, raw_response.input_tokens, raw_response.output_tokens
+    )
+    summary = summarize_verdicts(verdict_response.verdicts)
+
+    save_result(
+        fingerprint=fingerprint,
+        item_id=unit.item.id,
+        mutation_type=unit.mutation_type.value,
+        severity=unit.severity.value,
+        model=unit.model,
+        strategy=unit.strategy,
+        verdicts=verdict_response.verdicts,
+        cost=float(cost),
+        input_tokens=raw_response.input_tokens,
+        output_tokens=raw_response.output_tokens,
+    )
+
+    tracker.log_run_start(
+        {
+            "model": unit.model,
+            "strategy": unit.strategy,
+            "mutation_type": unit.mutation_type.value,
+            "severity": unit.severity.value,
+            "item_id": unit.item.id,
+        }
+    )
+    tracker.log_metrics(
+        {
+            "cost": float(cost),
+            "input_tokens": raw_response.input_tokens,
+            "output_tokens": raw_response.output_tokens,
+            **summary,
+        }
+    )
+    tracker.log_run_end()
+
+    cache.mark_done(fingerprint)
+
+
+def run_pipeline(
+    items: list[Item],
+    mutation_types: list[MutationType],
+    severities: list[Severity],
+    models: list[str],
+    strategies: list[str],
+    provider: BatchProvider,
+    cache: Cache,
+    ledger: Ledger,
+    tracker: Tracker,
+    pricing: dict[str, ModelPricing],
+    model_configs: dict[str, ModelConfig],
+    seed: int,
+    manifest_path: Path,
+    max_per_batch: int = 50_000,
+    poll_interval_seconds: int = 15,
+    fair_representation_candidates: list[str] | None = None,
+) -> None:
+    """
+    Runs the full pipeline: plans remaining work, applies mutations,
+    submits it in batches, waits for completion, records results.
+    """
+    mutations_by_type = build_mutations_by_type(items, fair_representation_candidates)
+    manifest = Manifest(git_commit=get_git_commit(), models=models, seed=seed)
+    check_manifest(manifest, manifest_path)
+    planned_units = plan_work(
+        items, mutation_types, severities, models, strategies, cache, seed
+    )
+
+    if not planned_units:
+        print("Nothing to do — all work already completed.")
+        return
+
+    # mutations_by_type = build_mutations_by_type(items)
+
+    requests = []
+    fingerprint_by_custom_id = {}
+    unit_by_custom_id = {}
+
+    for unit in planned_units:
+        request, fingerprint = build_request_for_unit(
+            unit, seed, mutations_by_type, model_configs
+        )
+        requests.append(request)
+        fingerprint_by_custom_id[request.custom_id] = fingerprint
+        unit_by_custom_id[request.custom_id] = unit
+
+    requests_by_model = {}
+    for request in requests:
+        requests_by_model.setdefault(request.endpoint, []).append(request)
+
+    chunks = []
+    for model_endpoint, model_requests in requests_by_model.items():
+        chunks.extend(chunk_requests(model_requests, max_per_batch))
+
+    for chunk in chunks:
+        batch_id = provider.submit_batch(chunk)
+        ledger.add_batch(batch_id)
+        print(f"Submitted batch {batch_id} with {len(chunk)} requests.")
+
+        while True:
+            status = provider.check_batch_status(batch_id)
+            if status == BatchStatus.COMPLETED:
+                break
+            if status == BatchStatus.FAILED:
+                raise RuntimeError(f"Batch {batch_id} failed.")
+            time.sleep(poll_interval_seconds)
+
+        raw_responses = provider.fetch_batch(batch_id)
+
+        for raw_response, request in zip(raw_responses, chunk):
+            custom_id = request.custom_id
+            unit = unit_by_custom_id[custom_id]
+            fingerprint = fingerprint_by_custom_id[custom_id]
+            process_response(raw_response, unit, fingerprint, pricing, tracker, cache)
+
+        ledger.remove_batch(batch_id)
+        print(f"Batch {batch_id} fully processed and removed from ledger.")
+
+# ===== execution/unit.py =====
+"""
+unit.py: builds the fingerprint: a unique, reproducible identifier for
+one specific API call, based on everything that could affect its result.
+"""
+
+import hashlib
+
+
+def build_fingerprint(
+    item_id: str,
+    model_name: str,
+    mutation_type: str,
+    severity: str,
+    seed: int,
+    strategy: str,
+    prompt_hash: str,
+) -> str:
+    """
+    Builds a unique fingerprint from all inputs that could affect the result.
+    Same inputs -> same fingerprint -> same call, safe to skip if already done.
+    """
+
+    input_data = "|".join(
+        [
+            item_id,
+            model_name,
+            mutation_type,
+            severity,
+            str(seed),
+            strategy,
+            prompt_hash,
+        ]
+    )
+
+    return hashlib.sha256(input_data.encode("utf-8")).hexdigest()
+
+# ===== main.py =====
+def main():
+    print("Hello from mllm!")
+
+
+if __name__ == "__main__":
+    main()
+
+# ===== mutations/base.py =====
+"""
+base.py: defines the Mutation protocol, Severity levels, and the shared vocabulary for all damage types.
+"""
+
+from enum import StrEnum
+from domain.item import Item
+from dataclasses import dataclass
+from typing import Protocol
+from pathlib import Path
+
+MUTATED_DIR = Path("data/mutated")
+
+
+def build_mutated_path(
+    item_id: str, mutation_name: str, severity: Severity, suffix: str
+) -> Path:
+    """
+    Builds the standard output path for a mutated image:
+    data/mutated/{item_id}/{mutation_name}_{severity}{suffix}
+    """
+    item_dir = MUTATED_DIR / item_id
+    item_dir.mkdir(parents=True, exist_ok=True)
+    return item_dir / f"{mutation_name}_{severity.value}{suffix}"
+
+
+def build_mutated_path_no_severity(
+    item_id: str, mutation_name: str, suffix: str
+) -> Path:
+    """
+    Builds the standard output path for a mutated image with no severity:
+    data/mutated/{item_id}/{mutation_name}{suffix}
+    """
+    item_dir = MUTATED_DIR / item_id
+    item_dir.mkdir(parents=True, exist_ok=True)
+    return item_dir / f"{mutation_name}{suffix}"
+
+
+class Severity(StrEnum):
+    SUBTLE = "subtle"
+    MODERATE = "moderate"
+    OBVIOUS = "obvious"
+
+
+class MutationType(StrEnum):
+    TECHNICAL_QUALITY = "technical_quality"
+    STANDARD_PRESENTATION = "standard_presentation"
+    VISUAL_CLARITY = "visual_clarity"
+    FUNCTIONAL_RELEVANCE = "functional_relevance"
+    FAIR_REPRESENTATION = "fair_representation"
+    TEXT_IMAGE_COHERENCE = "text_image_coherence"
+
+
+@dataclass(frozen=True)
+class MutatedItem:
+    original: Item
+    mutation_type: MutationType
+    severity: Severity
+    mutated_image: str
+
+
+class Mutation(Protocol):
+    def apply(self, item: Item, severity: Severity, seed: int) -> MutatedItem: ...
+
+    def name(self) -> str: ...
+
+# ===== mutations/fair_representation.py =====
+"""fair_representation.py: constructs the mutation to target the fair representation trait. The mutation swaps images of the multiple-choice dataset with stereotype-containing images from the cmsc dataset"""
+
+import random
+from PIL import Image
+from pathlib import Path
+
+from mutations.base import (
+    MutatedItem,
+    MutationType,
+    Severity,
+    build_mutated_path_no_severity,
+)
+
+from domain.item import Item
+
+
+class FairRepresentationMutation:
+    def __init__(self, candidates: list[Path]):
+        self.candidates = candidates
+
+    def name(self) -> str:
+        return "fair_representation_swap"
+
+    def apply(self, item: Item, severity: Severity, seed: int) -> MutatedItem:
+        original_path = Path(item.image)
+        new_path = build_mutated_path_no_severity(
+            item.id, self.name(), original_path.suffix
+        )
+
+        if new_path.exists():
+            return MutatedItem(
+                original=item,
+                mutation_type=MutationType.FAIR_REPRESENTATION,
+                severity=severity,
+                mutated_image=str(new_path),
+            )
+
+        rng = random.Random(seed)
+        substitute = rng.choice(self.candidates)
+        substitute_image = Image.open(substitute)
+        substitute_image.save(new_path)
+
+        return MutatedItem(
+            original=item,
+            mutation_type=MutationType.FAIR_REPRESENTATION,
+            severity=severity,
+            mutated_image=str(new_path),
+        )
+
+# ===== mutations/fair_representation_pool.py =====
+"""
+Builds the image pool for FairRepresentationMutation from a local CMSC directory.
+
+* Filters images by curated trait, race, gender, and age combinations.
+* Collects ALL matching images across all img_sets, for every combination.
+* Randomness for WHICH image gets used happens later, in FairRepresentationMutation.
+* Expected file layout: `{root}/{gender}_{age}/{trait}/img_set_{n}/{Race}-{age}-{gender}-{trait}.jpg`
+* Note: Restricted to combinations where the stereotype is visible in a single
+  image, since the judge model evaluates one image at a time with no access
+  to dataset-level demographic patterns (e.g. "career" paired only with male
+  images is a pattern, not something visible in one photo, and was excluded).
+"""
+
+from dataclasses import dataclass
+from pathlib import Path
+
+GENDERS = ["male", "female"]
+AGES = ["young", "old"]
+
+
+@dataclass(frozen=True)
+class FlaggedCombination:
+    trait: str
+    race: str | None = None
+    gender: str | None = None
+    age: str | None = None
+
+
+DRAFT_FLAGGED_COMBINATIONS: list[FlaggedCombination] = [
+    FlaggedCombination(trait="badstudent", race="Black", gender="male", age="young"),
+    FlaggedCombination(trait="weapon", race="Black", gender="male", age="young"),
+    FlaggedCombination(trait="belligerent", race="MiddleEastern", gender="male"),
+    FlaggedCombination(trait="unpleasant", race="Black", gender="female"),
+]
+
+
+def _race_matches(image_path: Path, combo: FlaggedCombination) -> bool:
+    """
+    Checks an image filename against a combination's required race.
+    """
+    if combo.race is None:
+        return True
+    stem_parts = image_path.stem.split("-")
+    if len(stem_parts) != 4:
+        return False
+    race = stem_parts[0]
+    return race == combo.race
+
+
+def build_candidate_pool(
+    cmsc_root: Path,
+    flagged_combinations: list[FlaggedCombination] = DRAFT_FLAGGED_COMBINATIONS,
+) -> list[str]:
+    """
+    Collects every image path matching any flagged combination.
+    A missing trait folder, or a combo with no matches, is skipped silently.
+    """
+    if not cmsc_root.is_dir():
+        raise FileNotFoundError(
+            f"{cmsc_root} does not exist or isn't a directory. "
+            "Check if the path is mounted and reachable."
+        )
+
+    candidates: list[str] = []
+
+    for combo in flagged_combinations:
+        genders = [combo.gender] if combo.gender else GENDERS
+        ages = [combo.age] if combo.age else AGES
+
+        for gender in genders:
+            for age in ages:
+                trait_dir = cmsc_root / f"{gender}_{age}" / combo.trait
+                if not trait_dir.is_dir():
+                    continue
+
+                img_set_dirs = sorted(
+                    p for p in trait_dir.glob("img_set_*") if p.is_dir()
+                )
+
+                for img_set in img_set_dirs:
+                    matching_images = sorted(
+                        p for p in img_set.glob("*.jpg") if _race_matches(p, combo)
+                    )
+                    candidates.extend(str(p) for p in matching_images)
+
+    return candidates
+
+# ===== mutations/functional_relevance.py =====
+"""
+functional_relevance.py: mutations that substitute the image with an unrelated one. Testing whether the model detects irrelevant images
+"""
+
+import random
+from pathlib import Path
+
+from domain.item import Item
+from PIL import Image
+from mutations.base import MutatedItem, MutationType, Severity, build_mutated_path
+
+
+class FunctionalRelevanceMutation:
+    def __init__(self, candidates: list[Item]):
+        self.candidates = candidates
+
+    def name(self) -> str:
+        return "funct_relevance_substitution"
+
+    def apply(self, item: Item, severity: Severity, seed: int) -> MutatedItem:
+        original_path = Path(item.image)
+        new_path = build_mutated_path(
+            item.id, self.name(), severity, original_path.suffix
+        )
+
+        if new_path.exists():
+            return MutatedItem(
+                original=item,
+                mutation_type=MutationType.FUNCTIONAL_RELEVANCE,
+                severity=severity,
+                mutated_image=str(new_path),
+            )
+
+        rng = random.Random(seed)
+        possible_substitutes = [
+            candidate for candidate in self.candidates if candidate.id != item.id
+        ]
+        substitute = rng.choice(possible_substitutes)
+        substitute_path = Path(substitute.image)
+
+        substitute_image = Image.open(substitute_path)
+        substitute_image.save(new_path)
+
+        return MutatedItem(
+            original=item,
+            mutation_type=MutationType.FUNCTIONAL_RELEVANCE,
+            severity=severity,
+            mutated_image=str(new_path),
+        )
+
+# ===== mutations/registry.py =====
+"""
+registry.py: maps mutation names to their classes.
+"""
+
+from mutations.base import Mutation
+from mutations.technical_quality import BlurMutation
+from mutations.standard_presentation import RotateMutation
+from mutations.visual_clarity import ClarityMutation
+from mutations.functional_relevance import FunctionalRelevanceMutation
+from mutations.text_image_coherence import TextImageCoherenceMutation
+from mutations.fair_representation import FairRepresentationMutation
+
+MUTATIONS: dict[str, type] = {
+    "funct_relevance_substitution": FunctionalRelevanceMutation,
+    "rotate": RotateMutation,
+    "blur": BlurMutation,
+    "coherence_substitution": TextImageCoherenceMutation,
+    "clarity_shapes": ClarityMutation,
+    "fair_repr_swap": FairRepresentationMutation,
+}
+
+
+def get_mutation(name: str, *args, **kwargs) -> Mutation:
+    """
+    Looks up a mutation class by name and constructs it.
+    Raises ValueError if the name isn't registered.
+    """
+    if name not in MUTATIONS:
+        raise ValueError(f"Unknown mutation: {name}")
+    mutation_class = MUTATIONS[name]
+    return mutation_class(*args, **kwargs)
+
+# ===== mutations/standard_presentation.py =====
+"""
+standard_presentation.py: mutations that damage an image's orientation, testing whether the model detects non-standard presentation.
+"""
+
+from pathlib import Path
+from PIL import Image
+
+from domain.item import Item
+from mutations.base import MutatedItem, MutationType, Severity, build_mutated_path
+
+
+class RotateMutation:
+    ANGLE_BY_SEVERITY = {
+        Severity.SUBTLE: 15,
+        Severity.MODERATE: 90,
+        Severity.OBVIOUS: 180,
+    }
+
+    def name(self) -> str:
+        return "rotate"
+
+    def apply(self, item: Item, severity: Severity, seed: int) -> MutatedItem:
+        original_path = Path(item.image)
+        new_path = build_mutated_path(
+            item.id, self.name(), severity, original_path.suffix
+        )
+
+        if new_path.exists():
+            return MutatedItem(
+                original=item,
+                mutation_type=MutationType.STANDARD_PRESENTATION,
+                severity=severity,
+                mutated_image=str(new_path),
+            )
+
+        original_image = Image.open(original_path)
+        rotated_image = original_image.rotate(
+            self.ANGLE_BY_SEVERITY[severity], expand=True
+        )
+        rotated_image.save(new_path)
+
+        return MutatedItem(
+            original=item,
+            mutation_type=MutationType.STANDARD_PRESENTATION,
+            severity=severity,
+            mutated_image=str(new_path),
+        )
+
+# ===== mutations/technical_quality.py =====
+"""
+technical_quality.py: mutations that damage an image's resolution, contrast,
+or legibility — testing whether the model detects poor technical quality.
+"""
+
+from PIL import Image, ImageFilter
+from pathlib import Path
+
+from mutations.base import (
+    Mutation,
+    MutatedItem,
+    MutationType,
+    Severity,
+    build_mutated_path,
+)
+from domain.item import Item
+
+
+class BlurMutation:
+    RADIUS_BY_SEVERITY = {
+        Severity.SUBTLE: 2,
+        Severity.MODERATE: 6,
+        Severity.OBVIOUS: 15,
+    }
+
+    def name(self) -> str:
+        return "blur"
+
+    def apply(self, item: Item, severity: Severity, seed: int) -> MutatedItem:
+        original_path = Path(item.image)
+        new_path = build_mutated_path(
+            item.id, self.name(), severity, original_path.suffix
+        )
+
+        if new_path.exists():
+            return MutatedItem(
+                original=item,
+                mutation_type=MutationType.TECHNICAL_QUALITY,
+                severity=severity,
+                mutated_image=str(new_path),
+            )
+
+        original_image = Image.open(original_path)
+        blurred_image = original_image.filter(
+            ImageFilter.GaussianBlur(self.RADIUS_BY_SEVERITY[severity])
+        )
+        blurred_image.save(new_path)
+
+        return MutatedItem(
+            original=item,
+            mutation_type=MutationType.TECHNICAL_QUALITY,
+            severity=severity,
+            mutated_image=str(new_path),
+        )
+
+# ===== mutations/text_image_coherence.py =====
+"""
+text_image_coherence.py: mutations that substitute the image with one from
+the same subject but a different topic, testing whether the model detects
+contradictions between the question text and the image.
+"""
+
+import random
+from pathlib import Path
+from PIL import Image
+
+from domain.item import Item
+from mutations.base import MutatedItem, MutationType, Severity, build_mutated_path
+
+
+class TextImageCoherenceMutation:
+    def __init__(self, candidates: list[Item]):
+        self.candidates = candidates
+
+    def name(self) -> str:
+        return "coherence_substitution"
+
+    def apply(self, item: Item, severity: Severity, seed: int) -> MutatedItem:
+        original_path = Path(item.image)
+        new_path = build_mutated_path(
+            item.id, self.name(), severity, original_path.suffix
+        )
+
+        if new_path.exists():
+            return MutatedItem(
+                original=item,
+                mutation_type=MutationType.TEXT_IMAGE_COHERENCE,
+                severity=severity,
+                mutated_image=str(new_path),
+            )
+
+        rng = random.Random(seed)
+        possible_substitutes = [
+            candidate
+            for candidate in self.candidates
+            if candidate.id != item.id
+            and candidate.topic != item.topic
+            and candidate.subject == item.subject
+        ]
+        substitute = rng.choice(possible_substitutes)
+        substitute_path = Path(substitute.image)
+
+        substitute_image = Image.open(substitute_path)
+        substitute_image.save(new_path)
+
+        return MutatedItem(
+            original=item,
+            mutation_type=MutationType.TEXT_IMAGE_COHERENCE,
+            severity=severity,
+            mutated_image=str(new_path),
+        )
+
+# ===== mutations/visual_clarity.py =====
+"""
+visual_clarity.py: mutations that add visual clutter — random shapes —
+testing whether the model detects reduced visual clarity.
+"""
+
+import random
+from pathlib import Path
+from PIL import Image, ImageDraw
+
+from domain.item import Item
+from mutations.base import MutatedItem, MutationType, Severity, build_mutated_path
+
+
+class ClarityMutation:
+    SHAPE_COUNT_BY_SEVERITY = {
+        Severity.SUBTLE: 2,
+        Severity.MODERATE: 5,
+        Severity.OBVIOUS: 10,
+    }
+    SHAPE_SIZE_FRACTION_BY_SEVERITY = {
+        Severity.SUBTLE: 0.05,
+        Severity.MODERATE: 0.10,
+        Severity.OBVIOUS: 0.20,
+    }
+
+    def name(self) -> str:
+        return "clarity_shapes"
+
+    def apply(self, item: Item, severity: Severity, seed: int) -> MutatedItem:
+        original_path = Path(item.image)
+        new_path = build_mutated_path(
+            item.id, self.name(), severity, original_path.suffix
+        )
+
+        if new_path.exists():
+            return MutatedItem(
+                original=item,
+                mutation_type=MutationType.VISUAL_CLARITY,
+                severity=severity,
+                mutated_image=str(new_path),
+            )
+
+        original_image = Image.open(original_path)
+        copied_image = original_image.copy()
+        draw = ImageDraw.Draw(copied_image)
+        rng = random.Random(seed)
+
+        width, height = copied_image.size
+        fraction = self.SHAPE_SIZE_FRACTION_BY_SEVERITY[severity]
+        shape_size = int(min(width, height) * fraction)
+        shape_count = self.SHAPE_COUNT_BY_SEVERITY[severity]
+
+        for _ in range(shape_count):
+            x = rng.randint(0, width - shape_size)
+            y = rng.randint(0, height - shape_size)
+            color = (rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255))
+            draw.ellipse([x, y, x + shape_size, y + shape_size], fill=color)
+
+        copied_image.save(new_path)
+
+        return MutatedItem(
+            original=item,
+            mutation_type=MutationType.VISUAL_CLARITY,
+            severity=severity,
+            mutated_image=str(new_path),
+        )
+
+# ===== prompting/builder.py =====
+"""
+builder.py: renders prompts from the Jinja template, given an item and
+a list of quality properties to evaluate (1 for split, 6 for combined).
+"""
+
+from jinja2 import Environment, FileSystemLoader, StrictUndefined
+from pathlib import Path
+import hashlib
+
+from domain.item import Item
+from domain.properties import QualityProperty, rubric_for
+
+TEMPLATE_DIR = Path(__file__).parent / "templates"
+
+env = Environment(
+    loader=FileSystemLoader(TEMPLATE_DIR),
+    undefined=StrictUndefined,
+)
+
+
+def build_prompt(item: Item, properties: list[QualityProperty]) -> str:
+    template = env.get_template("combined.jinja")
+
+    prop_data = [
+        {"name": prop.value, "definition": rubric_for(prop).definition}
+        for prop in properties
+    ]
+
+    return template.render(
+        characteristics=f"Grade: {item.grade}, Subject: {item.subject}, Topic: {item.topic}",
+        question=item.question,
+        properties=prop_data,
+    )
+
+
+def hash_prompt(prompt: str) -> str:
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+
+# ===== prompting/schema.py =====
+"""
+schema.py: defines the expected shape of an AI model's response, covering both the split (single-property)
+and combined (multi-property) strategies.
+"""
+
+from pydantic import BaseModel, ConfigDict, model_validator
+from domain.verdict import Verdict
+
+
+class VerdictResponse(BaseModel):
+    """
+    The AI's response to a prompt: one or more Verdicts,
+    depending on whether the prompt was split or combined.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    verdicts: list[Verdict]
+
+    @model_validator(mode="after")
+    def check_no_duplicate_properties(self) -> Self:
+        properties = [v.property for v in self.verdicts]
+        if len(properties) != len(set(properties)):
+            raise ValueError("Duplicate QualityProperty found in verdicts.")
+        return self
+
+# ===== providers/base.py =====
+"""
+base.py: defines RawResponse (a normalized, provider-agnostic response)
+and the BatchProvider protocol every provider must implement.
+"""
+
+from dataclasses import dataclass
+from typing import Protocol
+from enum import StrEnum
+
+
+class BatchStatus(StrEnum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class RawResponse:
+    custom_id: str
+    content: str
+    input_tokens: int
+    output_tokens: int
+
+
+@dataclass(frozen=True)
+class PromptRequest:
+    custom_id: str
+    prompt: str
+    endpoint: str
+    image_path: str | None = None
+
+    def __post_init__(self):
+        if len(self.custom_id) == 0:
+            raise ValueError("The field `custom_id` can't be empty.")
+        if len(self.prompt) == 0:
+            raise ValueError("The field `prompt` can't be empty.")
+
+
+class BatchProvider(Protocol):
+
+    def submit_batch(self, requests: list[PromptRequest]) -> str: ...
+    def check_batch_status(self, batch_id: str) -> BatchStatus: ...
+    def fetch_batch(self, batch_id: str) -> list[RawResponse]: ...
+
+# ===== providers/nebius_provider.py =====
+"""
+nebius_provider.py: Nebius implementation of the BatchProvider protocol.
+"""
+
+import json
+from pathlib import Path
+from openai import OpenAI
+import base64
+
+from providers.base import BatchProvider, RawResponse, BatchStatus, PromptRequest
+
+BATCH_DIR = Path("runs/batches")
+
+
+class NebiusProvider:
+    def __init__(self, api_key: str):
+        self.client = OpenAI(
+            base_url="https://api.tokenfactory.nebius.com/v1/", api_key=api_key
+        )
+        self._encoded_images: dict[str, str] = {}
+
+    def _get_or_encode_image(self, image_path: str) -> str:
+        if image_path in self._encoded_images:
+            return self._encoded_images[image_path]
+
+        with open(image_path, "rb") as f:
+            result = base64.b64encode(f.read()).decode("utf-8")
+
+        self._encoded_images[image_path] = result
+        return result
+
+    def _build_batch_line(self, request: PromptRequest) -> dict:
+        content = [{"type": "text", "text": request.prompt}]
+
+        if request.image_path is not None:
+            encoded_image = self._get_or_encode_image(request.image_path)
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64, {encoded_image}"},
+                }
+            )
+
+        return {
+            "custom_id": request.custom_id,
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": {
+                "model": "Qwen/Qwen2.5-VL-72B-Instruct",  # placeholder for now
+                "messages": [{"role": "user", "content": content}],
+            },
+        }
+
+    def submit_batch(self, requests: list[PromptRequest]) -> str:
+        BATCH_DIR.mkdir(parents=True, exist_ok=True)
+
+        lines = [self._build_batch_line(r) for r in requests]
+
+        batch_file_path = BATCH_DIR / "batch_input.jsonl"
+        with open(batch_file_path, "w") as f:
+            for line in lines:
+                f.write(json.dumps(line) + "\n")
+
+        with open(batch_file_path, "rb") as f:
+            uploaded_file = self.client.files.create(file=f, purpose="batch")
+
+        batch = self.client.batches.create(
+            input_file_id=uploaded_file.id,
+            endpoint="/v1/chat/completions",
+            completion_window="24h",
+        )
+
+        return batch.id
+
+    def check_batch_status(self, batch_id: str) -> BatchStatus:
+        batch = self.client.batches.retrieve(batch_id)
+
+        if batch.status == "completed":
+            return BatchStatus.COMPLETED
+        elif batch.status in ("failed", "expired", "cancelled"):
+            return BatchStatus.FAILED
+        else:
+            return BatchStatus.PENDING
+
+    def fetch_batch(self, batch_id: str) -> list[RawResponse]:
+        batch = self.client.batches.retrieve(batch_id)
+
+        result_file = self.client.files.content(batch.output_file_id)
+        lines = result_file.text.strip().split("\n")
+
+        return [self._parse_batch_line(line) for line in lines]
+
+    def _parse_batch_line(self, line: str) -> RawResponse:
+        data = json.loads(line)
+        custom_id = data["custom_id"]
+        body = data["response"]["body"]
+
+        content = body["choices"][0]["message"]["content"]
+        usage = body["usage"]
+
+        return RawResponse(
+            custom_id=custom_id,
+            content=content,
+            input_tokens=usage["prompt_tokens"],
+            output_tokens=usage["completion_tokens"],
+        )
+
+# ===== providers/openai_provider.py =====
+"""
+openai_provider.py: OpenAI implementation of the BatchProvider protocol.
+"""
+
+import json
+import base64
+from pathlib import Path
+from openai import OpenAI
+
+from providers.base import BatchProvider, RawResponse, BatchStatus, PromptRequest
+
+BATCH_DIR = Path("runs/batches")
+MAX_BATCH_FILE_BYTES = 190 * 1024 * 1024  # safe margin under OpenAI's 200 MB limit
+
+
+class OpenAIProvider:
+    def __init__(self, api_key: str):
+        self.client = OpenAI(api_key=api_key)
+        self._uploaded_files: dict[str, str] = {}
+
+    def _get_or_encode_image(self, image_path: str) -> str:
+        if image_path in self._uploaded_files:
+            return self._uploaded_files[image_path]
+
+        with open(image_path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("utf-8")
+
+        self._uploaded_files[image_path] = encoded
+        return encoded
+
+    def _build_batch_line(self, request: PromptRequest) -> dict:
+        content = [{"type": "input_text", "text": request.prompt}]
+
+        if request.image_path is not None:
+            encoded_image = self._get_or_encode_image(request.image_path)
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": f"data:image/png;base64,{encoded_image}",
+                }
+            )
+
+        return {
+            "custom_id": request.custom_id,
+            "method": "POST",
+            "url": "/v1/responses",
+            "body": {
+                "model": request.endpoint,
+                "input": [{"role": "user", "content": content}],
+            },
+        }
+
+    def submit_batch(self, requests: list[PromptRequest]) -> str:
+        BATCH_DIR.mkdir(parents=True, exist_ok=True)
+
+        lines = []
+        total_bytes = 0
+        for i, request in enumerate(requests):
+            line = self._build_batch_line(request)
+            lines.append(line)
+            total_bytes += len(json.dumps(line).encode("utf-8"))
+            if (i + 1) % 100 == 0 or (i + 1) == len(requests):
+                print(
+                    f"Built {i + 1}/{len(requests)} requests... ({total_bytes / (1024**2):.1f} MB)"
+                )
+
+        if total_bytes > MAX_BATCH_FILE_BYTES:
+            raise ValueError(
+                f"Batch file would be {total_bytes / (1024**2):.1f} MB, over the "
+                f"{MAX_BATCH_FILE_BYTES / (1024**2):.0f} MB safe limit. Lower --max-per-batch."
+            )
+
+        batch_file_path = BATCH_DIR / "batch_input.jsonl"
+        with open(batch_file_path, "w") as f:
+            for line in lines:
+                f.write(json.dumps(line) + "\n")
+
+        with open(batch_file_path, "rb") as f:
+            uploaded_file = self.client.files.create(file=f, purpose="batch")
+
+        batch = self.client.batches.create(
+            input_file_id=uploaded_file.id,
+            endpoint="/v1/responses",
+            completion_window="24h",
+        )
+
+        return batch.id
+
+    def check_batch_status(self, batch_id: str) -> BatchStatus:
+        batch = self.client.batches.retrieve(batch_id)
+
+        if batch.status == "completed":
+            return BatchStatus.COMPLETED
+        elif batch.status in ("failed", "expired", "cancelled"):
+            return BatchStatus.FAILED
+        else:
+            return BatchStatus.PENDING
+
+    def fetch_batch(self, batch_id: str) -> list[RawResponse]:
+        batch = self.client.batches.retrieve(batch_id)
+
+        if batch.output_file_id is None:
+            raise RuntimeError(
+                f"Batch {batch_id} status={batch.status} but has no output_file_id."
+            )
+
+        result_file = self.client.files.content(batch.output_file_id)
+        lines = result_file.text.strip().split("\n")
+
+        return [self._parse_batch_line(line) for line in lines]
+
+    def _parse_batch_line(self, line: str) -> RawResponse:
+        data = json.loads(line)
+        custom_id = data["custom_id"]
+        body = data["response"]["body"]
+
+        message_block = next(
+            item for item in body["output"] if item["type"] == "message"
+        )
+        content = message_block["content"][0]["text"]
+        usage = body["usage"]
+
+        return RawResponse(
+            custom_id=custom_id,
+            content=content,
+            input_tokens=usage["input_tokens"],
+            output_tokens=usage["output_tokens"],
+        )
+
+# ===== providers/registry.py =====
+"""
+registry.py: maps provider names to their classes
+"""
+
+from providers.base import BatchProvider
+from providers.openai_provider import OpenAIProvider
+from providers.nebius_provider import NebiusProvider
+
+# from providers.nebius_provider import NebiusProvider
+
+PROVIDERS: dict[str, type] = {
+    "openai": OpenAIProvider,
+    "nebius": NebiusProvider,
+}
+
+
+def get_provider(name: str, *args, **kwargs) -> BatchProvider:
+    """
+    Looks up a provider class by name and constructs it.
+    Raises ValueError if the name isn't registered.
+    """
+    if name not in PROVIDERS:
+        raise ValueError(f"Unknown provider: {name}")
+    provider_class = PROVIDERS[name]
+    return provider_class(*args, **kwargs)
+
+# ===== scratch.py =====
+"""
+Throwaway script - not a real test.
+Checks that the pool + mutation actually work together, end to end.
+"""
+
+from pathlib import Path
+from mutations.fair_representation_pool import build_candidate_pool
+from mutations.fair_representation import FairRepresentationMutation
+from mutations.base import Severity
+from domain.item import Item
+
+CMSC_ROOT = Path("/home/ldap/coccia@private.list.lu/oat_2024/MLLM/data/cmsc")
+
+pool = build_candidate_pool(CMSC_ROOT)
+print(f"Pool size: {len(pool)}")
+print("First 3 candidates:")
+for p in pool[:3]:
+    print(f"  {p}")
+
+candidate_paths = [Path(p) for p in pool]
+
+fake_item = Item(
+    id="scratch_check_1",
+    question="Q",
+    choices=("a", "b"),
+    answer=0,
+    hint="",
+    image=pool[0],  # reuse a real candidate as the "original" for this check
+    task="t",
+    grade="g",
+    subject="s",
+    topic="t",
+    category="c",
+    skill="sk",
+    lecture="",
+    solution="",
+    split="train",
+)
+
+mutation = FairRepresentationMutation(candidates=candidate_paths)
+result = mutation.apply(fake_item, Severity.OBVIOUS, seed=1)
+
+print(f"\nMutated image saved to: {result.mutated_image}")
+print("Open it and look — is it a real stereotype-tagged image?")
+
+# ===== tests/unit/test_batch.py =====
+"""
+test_batch.py: tests for chunk_requests.
+"""
+
+from providers.base import PromptRequest
+from execution.batch import chunk_requests
+
+
+def test_chunk_requests_splits_evenly():
+    requests = [
+        PromptRequest(custom_id=f"q{i}", prompt="test", endpoint="test")
+        for i in range(10)
+    ]
+    chunks = chunk_requests(requests, max_per_batch=5)
+    assert len(chunks) == 2
+    assert len(chunks[0]) == 5
+    assert len(chunks[1]) == 5
+
+
+def test_chunk_requests_handles_remainder():
+    requests = [
+        PromptRequest(custom_id=f"q{i}", prompt="test", endpoint="test")
+        for i in range(12)
+    ]
+    chunks = chunk_requests(requests, max_per_batch=5)
+    assert len(chunks) == 3
+    assert len(chunks[0]) == 5
+    assert len(chunks[1]) == 5
+    assert len(chunks[2]) == 2
+
+
+def test_chunk_requests_single_chunk_if_under_limit():
+    requests = [
+        PromptRequest(custom_id=f"q{i}", prompt="test", endpoint="test")
+        for i in range(2)
+    ]
+    chunks = chunk_requests(requests, max_per_batch=5)
+    assert len(chunks) == 1
+    assert len(chunks[0]) == 2
+
+# ===== tests/unit/test_builder.py =====
+"""
+test_builder.py: tests for build_prompt and hash_prompt
+"""
+
+from prompting.builder import build_prompt, hash_prompt
+from domain.properties import QualityProperty
+from domain.item import Item
+
+
+def make_item(**overrides):
+    defaults = dict(
+        id="q1",
+        question="What is 2+2?",
+        choices=("3", "4", "5"),
+        answer=1,
+        hint="",
+        image="img.png",
+        task="t",
+        grade="3",
+        subject="math",
+        topic="arithmetic",
+        category="c",
+        skill="sk",
+        lecture="",
+        solution="",
+        split="train",
+    )
+    defaults.update(overrides)
+    return Item(**defaults)
+
+
+def test_build_prompt_includes_question():
+    item = make_item()
+    prompt = build_prompt(item, [QualityProperty.TECHNICAL_QUALITY])
+    assert item.question in prompt
+
+
+def test_build_prompt_split_includes_only_one_property():
+    item = make_item()
+    prompt = build_prompt(item, [QualityProperty.TECHNICAL_QUALITY])
+    assert "technical_quality" in prompt
+    assert "visual_clarity" not in prompt
+
+
+def test_build_prompt_combined_includes_all_properties():
+    item = make_item()
+    prompt = build_prompt(item, list(QualityProperty))
+    for prop in QualityProperty:
+        assert prop.value in prompt
+
+
+def test_hash_prompt_is_deterministic():
+    assert hash_prompt("same text") == hash_prompt("same text")
+
+
+def test_hash_prompt_differs_for_different_text():
+    assert hash_prompt("text a") != hash_prompt("text b")
+
+# ===== tests/unit/test_cache.py =====
+"""
+test_cache.py: tests for Cache.
+"""
+
+from pathlib import Path
+from execution.cache import Cache
+
+
+def test_fresh_cache_has_nothing_done(tmp_path):
+    cache_path = tmp_path / "cache.txt"
+    cache = Cache(cache_path)
+    assert cache.is_done("fp1") is False
+
+
+def test_mark_done_updates_in_memory(tmp_path):
+    cache_path = tmp_path / "cache.txt"
+    cache = Cache(cache_path)
+    cache.mark_done("fp1")
+    assert cache.is_done("fp1") is True
+
+
+def test_cache_persists_across_restart(tmp_path):
+    cache_path = tmp_path / "cache.txt"
+
+    cache1 = Cache(cache_path)
+    cache1.mark_done("fp1")
+
+    cache2 = Cache(cache_path)
+    assert cache2.is_done("fp1") is True
+    assert cache2.is_done("fp2") is False
+
+# ===== tests/unit/test_cli.py =====
+"""
+test_cli.py: tests for the CLI commands.
+"""
+
+import pandas as pd
+from typer.testing import CliRunner
+
+from cli import app
+
+runner = CliRunner()
+
+
+def test_sample_command(tmp_path):
+    input_csv = tmp_path / "input.csv"
+    output_csv = tmp_path / "output.csv"
+
+    df = pd.DataFrame(
+        {
+            "subject": ["math"] * 50 + ["science"] * 50,
+            "question": [f"q{i}" for i in range(100)],
+        }
+    )
+    df.to_csv(input_csv, index=False)
+
+    result = runner.invoke(
+        app,
+        [
+            "sample",
+            "--input-csv",
+            str(input_csv),
+            "--output-csv",
+            str(output_csv),
+            "--fraction",
+            "0.1",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert output_csv.exists()
+
+    sample_df = pd.read_csv(output_csv)
+    assert 8 <= len(sample_df) <= 12
+
+# ===== tests/unit/test_config.py =====
+"""
+test_config.py: tests if the config.py file works as intended. (Secrets, ModelConfig, and pricing loading)
+"""
+
+from pathlib import Path
+import pytest
+from pydantic import ValidationError
+from config import Secrets, load_model_config, load_pricing
+
+
+def test_secrets_load_from_env(monkeypatch):
+    """
+    Tests whether the correct api keys are loaded
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
+    monkeypatch.setenv("NEBIUS_API_KEY", "test-nebius")
+
+    secrets = Secrets()
+    assert secrets.openai_api_key == "test-openai"
+
+
+def test_secrets_rejects_unknown_field(monkeypatch):
+    """Tests whether non-conforming keys are rejectedl."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
+    monkeypatch.setenv("NEBIUS_API_KEY", "test-nebius")
+    monkeypatch.setenv("SOME_TYPO", "oops")
+    secrets = Secrets()
+    assert secrets.openai_api_key == "test-openai"
+
+
+def test_load_model_config_reads_valid_yaml(tmp_path):
+    """
+    Tests whether the load_model_config function parses yaml files correctly
+    """
+    yaml_content = """
+    name: gpt-4
+    provider: openai
+    endpoint: gpt-4-0613
+    """
+
+    config_file = tmp_path / "gpt-4.yaml"
+    config_file.write_text(yaml_content)
+
+    config = load_model_config(config_file)
+
+    assert config.name == "gpt-4"
+    assert config.provider == "openai"
+    assert config.endpoint == "gpt-4-0613"
+
+
+def test_load_model_config_missing_fields_raises(tmp_path):
+    """
+    Model configs without all the required fields should raise.
+    """
+    yaml_content = """
+    name: gpt-4    
+    """
+    config_file = tmp_path / "broken.yaml"
+    config_file.write_text(yaml_content)
+
+    with pytest.raises(ValidationError):
+        load_model_config(config_file)
+
+
+def test_load_pricing_reads_valid_yaml(tmp_path):
+    """
+    Tests whether the load_pricing_config function parses yaml files correctly
+    """
+    yaml_content = """
+    gpt-4: 
+        input_per_million: 3.0
+        output_per_million: 12.0
+    """
+    pricing_file = tmp_path / "pricing-test.yaml"
+    pricing_file.write_text(yaml_content)
+
+    pricing = load_pricing(pricing_file)
+    assert pricing["gpt-4"].input_per_million == 3.0
+    assert pricing["gpt-4"].output_per_million == 12.0
+
+
+def test_load_pricing_missing_fields_raises(tmp_path):
+    """
+    Pricing yaml files without all the required fields should raise.
+    """
+    yaml_content = """
+    gpt-4: 
+        input_per_million: 3.0
+    """
+    pricing_file = tmp_path / "broken-pricing.yaml"
+    pricing_file.write_text(yaml_content)
+
+    with pytest.raises(ValidationError):
+        load_pricing(pricing_file)
+
+# ===== tests/unit/test_curves.py =====
+"""
+test_curves.py: tests for detection_rate_by_severity.
+"""
+
+from evaluation.curves import detection_rate_by_severity
+from evaluation.load import LoadedResult
+from domain.verdict import Verdict
+from domain.properties import QualityProperty
+
+
+def make_result(severity, passed):
+    return LoadedResult(
+        item_id="q1",
+        mutation_type="technical_quality",
+        severity=severity,
+        model="gpt5.6",
+        strategy="split",
+        verdicts=[
+            Verdict(
+                property=QualityProperty.TECHNICAL_QUALITY,
+                passed=passed,
+                reasoning="" if passed else "damaged",
+            )
+        ],
+        cost=0.0001,
+        input_tokens=100,
+        output_tokens=10,
+    )
+
+
+def test_detection_rate_improves_with_severity():
+    results = [
+        make_result("subtle", passed=True),
+        make_result("subtle", passed=False),
+        make_result("obvious", passed=False),
+    ]
+
+    output = detection_rate_by_severity(results)
+
+    assert output["subtle"]["recall"] == 0.5
+    assert output["obvious"]["recall"] == 1.0
+
+# ===== tests/unit/test_experiment_sample.py =====
+"""
+test_experiment_sample.py: tests for build_phase1_sample.
+"""
+
+import pandas as pd
+import numpy as np
+from data.experiment_sample import build_phase1_sample
+
+
+def make_fake_dataframe(n_rows=100, seed=0):
+    np.random.seed(seed)
+    subjects = np.random.choice(
+        ["math", "science", "history"], size=n_rows, p=[0.5, 0.3, 0.2]
+    )
+    return pd.DataFrame(
+        {
+            "subject": subjects,
+            "question": [f"question {i}" for i in range(n_rows)],
+        }
+    )
+
+
+def test_phase1_sample_size():
+    fake_df = make_fake_dataframe(100, 0)
+    sample_df = build_phase1_sample(fake_df, 0.1, "subject", 0)
+
+    assert 8 < len(sample_df) < 12
+
+
+def test_phase1_sample_preserves_columns():
+    fake_df = make_fake_dataframe(100, 0)
+    sample_df = build_phase1_sample(fake_df, 0.1, "subject", 0)
+
+    assert list(fake_df.columns) == list(sample_df.columns)
+
+
+def test_phase1_sample_is_reproducible():
+    fake_df = make_fake_dataframe(100, 0)
+    sample_df1 = build_phase1_sample(fake_df, 0.1, "subject", 0)
+    sample_df2 = build_phase1_sample(fake_df, 0.1, "subject", 0)
+    assert sample_df1.equals(sample_df2)
+
+# ===== tests/unit/test_fair_representation.py =====
+"""
+test_fair_representation.py: tests for FairRepresentationMutation.
+"""
+
+from pathlib import Path
+from PIL import Image
+
+from mutations.fair_representation import FairRepresentationMutation
+from mutations.base import Severity, MutationType
+from domain.item import Item
+
+
+def make_item(image_path: str, item_id: str = "q1", **overrides):
+    defaults = dict(
+        id=item_id,
+        question="Q",
+        choices=("a", "b"),
+        answer=0,
+        hint="",
+        image=image_path,
+        task="t",
+        grade="g",
+        subject="s",
+        topic="t",
+        category="c",
+        skill="sk",
+        lecture="",
+        solution="",
+        split="train",
+    )
+    defaults.update(overrides)
+    return Item(**defaults)
+
+
+def make_test_image(path: Path, color: str) -> None:
+    img = Image.new("RGB", (50, 50), color=color)
+    img.save(path)
+
+
+def test_fair_representation_produces_valid_mutated_item(tmp_path):
+    original_path = tmp_path / "original.png"
+    make_test_image(original_path, "red")
+    item = make_item(str(original_path), item_id="fr_prod_1")
+
+    candidate_path = tmp_path / "candidate.png"
+    make_test_image(candidate_path, "blue")
+
+    mutation = FairRepresentationMutation(candidates=[candidate_path])
+    result = mutation.apply(item, Severity.OBVIOUS, seed=42)
+
+    assert result.mutation_type == MutationType.FAIR_REPRESENTATION
+    assert result.severity == Severity.OBVIOUS
+    assert Path(result.mutated_image).exists()
+
+
+def test_fair_representation_substitutes_with_candidate_image(tmp_path):
+    original_path = tmp_path / "original.png"
+    make_test_image(original_path, "red")
+    item = make_item(str(original_path), item_id="fr_sub_1")
+
+    candidate_path = tmp_path / "candidate.png"
+    make_test_image(candidate_path, "blue")
+
+    mutation = FairRepresentationMutation(candidates=[candidate_path])
+    result = mutation.apply(item, Severity.MODERATE, seed=42)
+
+    mutated_image = Image.open(result.mutated_image).convert("RGB")
+    pixel = mutated_image.getpixel((0, 0))
+    assert pixel == (0, 0, 255)
+
+
+def test_fair_representation_picks_randomly_from_candidates(tmp_path):
+    original_path = tmp_path / "original.png"
+    make_test_image(original_path, "red")
+    item = make_item(str(original_path), item_id="fr_rand_1")
+
+    candidate_1 = tmp_path / "candidate1.png"
+    make_test_image(candidate_1, "blue")
+    candidate_2 = tmp_path / "candidate2.png"
+    make_test_image(candidate_2, "green")
+
+    seen_pixels = set()
+    for seed in range(10):
+        # each seed needs its own item id, otherwise new_path collides
+        # and idempotency stops the second call from writing anything
+        seeded_item = make_item(str(original_path), item_id=f"fr_rand_{seed}")
+        mutation = FairRepresentationMutation(candidates=[candidate_1, candidate_2])
+        result = mutation.apply(seeded_item, Severity.SUBTLE, seed=seed)
+        mutated_image = Image.open(result.mutated_image).convert("RGB")
+        seen_pixels.add(mutated_image.getpixel((0, 0)))
+
+    # over 10 different seeds, both candidates should show up at least once
+    assert (0, 0, 255) in seen_pixels or (0, 255, 0) in seen_pixels
+    assert len(seen_pixels) > 1
+
+
+def test_fair_representation_is_idempotent(tmp_path):
+    original_path = tmp_path / "original.png"
+    make_test_image(original_path, "red")
+    item = make_item(str(original_path), item_id="fr_idem_1")
+
+    candidate_path = tmp_path / "candidate.png"
+    make_test_image(candidate_path, "blue")
+
+    mutation = FairRepresentationMutation(candidates=[candidate_path])
+    first_result = mutation.apply(item, Severity.OBVIOUS, seed=1)
+    first_mtime = Path(first_result.mutated_image).stat().st_mtime
+
+    # second call, different seed on purpose: if idempotency works,
+    # it must return early and never re-pick or re-save
+    second_result = mutation.apply(item, Severity.OBVIOUS, seed=999)
+    second_mtime = Path(second_result.mutated_image).stat().st_mtime
+
+    assert first_result.mutated_image == second_result.mutated_image
+    assert first_mtime == second_mtime
+
+
+def test_fair_representation_same_file_across_all_severities(tmp_path):
+    original_path = tmp_path / "original.png"
+    make_test_image(original_path, "red")
+    item = make_item(str(original_path), item_id="fr_sev_1")
+
+    candidate_path = tmp_path / "candidate.png"
+    make_test_image(candidate_path, "blue")
+
+    mutation = FairRepresentationMutation(candidates=[candidate_path])
+
+    subtle_result = mutation.apply(item, Severity.SUBTLE, seed=1)
+    moderate_result = mutation.apply(item, Severity.MODERATE, seed=1)
+    obvious_result = mutation.apply(item, Severity.OBVIOUS, seed=1)
+
+    assert subtle_result.mutated_image == moderate_result.mutated_image
+    assert moderate_result.mutated_image == obvious_result.mutated_image
+
+# ===== tests/unit/test_fair_representation_pool.py =====
+"""
+test_fair_representation_pool.py: tests for build_candidate_pool.
+"""
+
+from pathlib import Path
+
+from mutations.fair_representation_pool import FlaggedCombination, build_candidate_pool
+
+
+def touch_image(
+    root: Path, gender: str, age: str, trait: str, set_n: int, race: str
+) -> Path:
+    image_dir = root / f"{gender}_{age}" / trait / f"img_set_{set_n}"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    image_path = image_dir / f"{race}-{age}-{gender}-{trait}.jpg"
+    image_path.touch()
+    return image_path
+
+
+def test_matches_fully_specified_combination(tmp_path):
+    target = touch_image(tmp_path, "male", "young", "badstudent", 1, "Black")
+    touch_image(tmp_path, "male", "young", "badstudent", 1, "White")  # should NOT match
+
+    combo = FlaggedCombination(
+        trait="badstudent", race="Black", gender="male", age="young"
+    )
+    result = build_candidate_pool(tmp_path, flagged_combinations=[combo])
+
+    assert result == [str(target)]
+
+
+def test_unspecified_race_matches_any_race(tmp_path):
+    black = touch_image(tmp_path, "male", "old", "career", 0, "Black")
+    white = touch_image(tmp_path, "male", "old", "career", 0, "White")
+
+    combo = FlaggedCombination(trait="career", gender="male", age="old")
+    result = build_candidate_pool(tmp_path, flagged_combinations=[combo])
+
+    assert sorted(result) == sorted([str(black), str(white)])
+
+
+def test_unspecified_gender_and_age_expand_to_all_four(tmp_path):
+    touch_image(tmp_path, "male", "young", "family", 0, "Latino")
+    touch_image(tmp_path, "male", "old", "family", 0, "Latino")
+    touch_image(tmp_path, "female", "young", "family", 0, "Latino")
+    touch_image(tmp_path, "female", "old", "family", 0, "Latino")
+
+    combo = FlaggedCombination(trait="family")
+    result = build_candidate_pool(tmp_path, flagged_combinations=[combo])
+
+    assert len(result) == 4
+
+
+def test_missing_trait_folder_is_skipped_not_an_error(tmp_path):
+    combo = FlaggedCombination(trait="doesnotexist", gender="male", age="young")
+    result = build_candidate_pool(tmp_path, flagged_combinations=[combo])
+
+    assert result == []
+
+
+def test_multiple_img_sets_are_all_collected(tmp_path):
+    first = touch_image(tmp_path, "female", "young", "science", 1, "Indian")
+    second = touch_image(tmp_path, "female", "young", "science", 2, "Latino")
+
+    combo = FlaggedCombination(trait="science", gender="female", age="young")
+    result = build_candidate_pool(tmp_path, flagged_combinations=[combo])
+
+    assert sorted(result) == sorted(
+        [first, second].__str__() and [str(first), str(second)]
+    )
+
+# ===== tests/unit/test_figures.py =====
+"""
+test_figures.py: tests for plot_detection_by_severity.
+"""
+
+from pathlib import Path
+from evaluation.figures import plot_detection_by_severity
+
+
+def test_plot_creates_file(tmp_path):
+    detection_rates = {
+        "subtle": {"precision": 1.0, "recall": 0.5, "f1": 0.67},
+        "obvious": {"precision": 1.0, "recall": 1.0, "f1": 1.0},
+    }
+    output_path = tmp_path / "chart.png"
+
+    plot_detection_by_severity(detection_rates, output_path)
+
+    assert output_path.exists()
+    assert output_path.stat().st_size > 0
+
+# ===== tests/unit/test_functional_relevance.py =====
+"""
+test_functional_relevance.py: tests for FunctionalRelevanceMutation.
+"""
+
+import pytest
+from PIL import Image
+from pathlib import Path
+
+from mutations.functional_relevance import FunctionalRelevanceMutation
+from mutations.base import Severity, MutationType
+from domain.item import Item
+
+
+def make_item(image_path: str, item_id: str = "q1", **overrides):
+    defaults = dict(
+        id=item_id,
+        question="Q",
+        choices=("a", "b"),
+        answer=0,
+        hint="",
+        image=image_path,
+        task="t",
+        grade="g",
+        subject="s",
+        topic="t",
+        category="c",
+        skill="sk",
+        lecture="",
+        solution="",
+        split="train",
+    )
+    defaults.update(overrides)
+    return Item(**defaults)
+
+
+def make_test_image(path: Path, color: str) -> None:
+    img = Image.new("RGB", (50, 50), color=color)
+    img.save(path)
+
+
+def test_relevance_produces_valid_mutated_item(tmp_path):
+    image_1_path = tmp_path / "image1.png"
+    make_test_image(image_1_path, "red")
+    item_1 = make_item(str(image_1_path), item_id="fr_prod_1")
+
+    image_2_path = tmp_path / "image2.png"
+    make_test_image(image_2_path, "blue")
+    item_2 = make_item(str(image_2_path), item_id="fr_prod_2")
+
+    mutation = FunctionalRelevanceMutation(candidates=[item_1, item_2])
+    result = mutation.apply(item_1, Severity.OBVIOUS, seed=42)
+
+    assert result.mutation_type == MutationType.FUNCTIONAL_RELEVANCE
+    assert result.severity == Severity.OBVIOUS
+    assert Path(result.mutated_image).exists()
+
+
+def test_relevance_substitutes_with_different_image(tmp_path):
+    image_1_path = tmp_path / "image1.png"
+    make_test_image(image_1_path, "red")
+    item_1 = make_item(str(image_1_path), item_id="fr_sub_1")
+
+    image_2_path = tmp_path / "image2.png"
+    make_test_image(image_2_path, "blue")
+    item_2 = make_item(str(image_2_path), item_id="fr_sub_2")
+
+    mutation = FunctionalRelevanceMutation(candidates=[item_1, item_2])
+    result = mutation.apply(item_1, Severity.OBVIOUS, seed=42)
+
+    mutated_image = Image.open(result.mutated_image).convert("RGB")
+    pixel = mutated_image.getpixel((0, 0))
+    assert pixel == (0, 0, 255)
+
+
+def test_relevance_never_substitutes_with_itself(tmp_path):
+    image_1_path = tmp_path / "image1.png"
+    make_test_image(image_1_path, "red")
+    item_1 = make_item(str(image_1_path), item_id="fr_never_1")
+
+    image_2_path = tmp_path / "image2.png"
+    make_test_image(image_2_path, "blue")
+    item_2 = make_item(str(image_2_path), item_id="fr_never_2")
+
+    image_3_path = tmp_path / "image3.png"
+    make_test_image(image_3_path, "green")
+    item_3 = make_item(str(image_3_path), item_id="fr_never_3")
+
+    mutation = FunctionalRelevanceMutation(candidates=[item_1, item_2, item_3])
+
+    for seed in range(10):
+        result = mutation.apply(item_1, Severity.OBVIOUS, seed=seed)
+        mutated_image = Image.open(result.mutated_image).convert("RGB")
+        pixel = mutated_image.getpixel((0, 0))
+        assert pixel != (255, 0, 0)
+
+# ===== tests/unit/test_item.py =====
+"""
+test_item.py: tests for the Item dataclass — construction, immutability,
+and validation of the answer/choices relationship.
+"""
+
+import pytest
+from domain.item import Item
+from domain.errors import ItemError
+
+
+def make_item(**overrides):
+    """Builds a valid item where only the keyword args provided are replaced for testing purposes."""
+    defaults = dict(
+        id="q1",
+        question="Q",
+        choices=("a", "b", "c"),
+        answer=1,
+        hint="",
+        image="img.png",
+        task="t",
+        grade="g",
+        subject="s",
+        topic="t",
+        category="c",
+        skill="sk",
+        lecture="",
+        solution="",
+        split="train",
+    )
+
+    defaults.update(overrides)
+    return Item(**defaults)
+
+
+# happy path
+def test_valid_item_builds():
+    """A normal, correct Item should build without error."""
+    item = make_item()
+    assert item.answer == 1
+    assert item.choices == ("a", "b", "c")
+
+
+# immutability
+def test_item_is_frozen():
+    """
+    Item is frozen=True. Trying to reassign a field after creation should raise, not silently succeed.
+    """
+    item = make_item()
+    with pytest.raises(Exception):
+        item.answer = 0
+
+
+# edge cases
+def test_answer_at_first_valid_index():
+    """
+    answer=0 is the smallest valid index and should not raise an error.
+    """
+    item = make_item(answer=0)
+    assert item.answer == 0
+
+
+def test_answer_at_last_valid_index():
+    """
+    choices has 3 items, so valid indices are 0, 1, 2.
+    answer = 2 is the largest valid index and should not raise an error.
+    """
+    item = make_item(answer=2)
+    assert item.answer == 2
+
+
+def test_answer_one_past_last_index_raises():
+    """
+    One-off boundary should raise an error.
+    """
+    with pytest.raises(ItemError):
+        make_item(answer=3)
+
+
+# sad path
+def test_negative_answer_raise():
+    """
+    answer indices can't be negative because choices are tuples and negative indexing doesn't work on tuples.
+    """
+    with pytest.raises(ItemError):
+        make_item(answer=-1)
+
+
+def test_empty_choices_raises():
+    """
+    An item must have choices, items with zero choices should raise an error before construction.
+    """
+    with pytest.raises(ItemError):
+        make_item(choices=())
+
+# ===== tests/unit/test_ledger.py =====
+"""
+test_ledger.py: tests for Ledger.
+"""
+
+from pathlib import Path
+from execution.ledger import Ledger
+
+
+def test_add_batch(tmp_path):
+    ledger_path = tmp_path / "ledger.txt"
+    ledger = Ledger(ledger_path)
+    ledger.add_batch("abc123")
+    assert "abc123" in ledger.get_pending()
+
+
+def test_remove_batch(tmp_path):
+    ledger_path = tmp_path / "ledger.txt"
+    ledger = Ledger(ledger_path)
+    ledger.add_batch("abc123")
+    ledger.remove_batch("abc123")
+    assert "abc123" not in ledger.get_pending()
+
+
+def test_ledger_persists_across_restart(tmp_path):
+    ledger_path = tmp_path / "ledger.txt"
+    ledger1 = Ledger(ledger_path)
+    ledger1.add_batch("abc123")
+    ledger2 = Ledger(ledger_path)  # simulates a fresh restart
+    assert "abc123" in ledger2.get_pending()
+
+# ===== tests/unit/test_load.py =====
+"""
+test_load.py: tests for load_results.
+"""
+
+from pathlib import Path
+from evaluation.load import load_results
+from execution.results import save_result
+from domain.verdict import Verdict
+from domain.properties import QualityProperty
+
+
+def test_load_results_reads_saved_files(tmp_path, monkeypatch):
+    import execution.results
+
+    monkeypatch.setattr(execution.results, "RESULTS_DIR", tmp_path)
+
+    verdicts = [
+        Verdict(
+            property=QualityProperty.TECHNICAL_QUALITY, passed=False, reasoning="blurry"
+        )
+    ]
+    save_result(
+        fingerprint="fp1",
+        item_id="q1",
+        mutation_type="technical_quality",
+        severity="obvious",
+        model="gpt5.6",
+        strategy="split",
+        verdicts=verdicts,
+        cost=0.0003,
+        input_tokens=1000,
+        output_tokens=50,
+    )
+
+    results = load_results(tmp_path)
+    assert len(results) == 1
+    assert results[0].item_id == "q1"
+    assert results[0].verdicts[0].property == QualityProperty.TECHNICAL_QUALITY
+
+# ===== tests/unit/test_manifest.py =====
+"""
+test_manifest.py: tests for Manifest, check_manifest, RunConfigDrift.
+"""
+
+import pytest
+from pathlib import Path
+from execution.manifest import Manifest, check_manifest, RunConfigDrift
+
+
+def test_first_check_writes_manifest(tmp_path):
+    path = tmp_path / "manifest.json"
+    m = Manifest(git_commit="abc123", models=["gpt5.6"], seed=42)
+    check_manifest(m, path)
+    assert path.exists()
+
+
+def test_matching_settings_passes_silently(tmp_path):
+    path = tmp_path / "manifest.json"
+    m = Manifest(git_commit="abc123", models=["gpt5.6"], seed=42)
+
+    check_manifest(m, path)  # writes it
+    check_manifest(m, path)  # writes it again with same settings, should not rise
+
+
+def test_different_settings_raises_drift(tmp_path):
+    path = tmp_path / "manifest.json"
+    m1 = Manifest(git_commit="abc123", models=["gpt5.6"], seed=42)
+    m2 = Manifest(git_commit="def456", models=["gpt5.5"], seed=99)
+    check_manifest(m1, path)
+    with pytest.raises(RunConfigDrift):
+        check_manifest(m2, path)  # same path, different settings, it should raise
+
+# ===== tests/unit/test_metrics.py =====
+"""
+test_metrics.py: tests for compute_confusion_counts and compute_metrics.
+"""
+
+from evaluation.metrics import compute_confusion_counts, compute_metrics
+from domain.verdict import Verdict
+from domain.properties import QualityProperty
+
+
+def test_compute_metrics_perfect_detection():
+    counts = {"tp": 5, "fp": 0, "fn": 0, "tn": 5}
+    result = compute_metrics(counts)
+    assert result["precision"] == 1.0
+    assert result["recall"] == 1.0
+    assert result["f1"] == 1.0
+
+
+def test_compute_metrics_no_positives_at_all():
+    counts = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+    result = compute_metrics(counts)
+    assert result["precision"] == 0.0
+    assert result["recall"] == 0.0
+    assert result["f1"] == 0.0
+
+
+def test_compute_metrics_partial():
+    counts = {"tp": 2, "fp": 2, "fn": 3, "tn": 3}
+    result = compute_metrics(counts)
+    assert result["precision"] == 0.5
+    assert result["recall"] == 0.4
+    assert 0.43 < result["f1"] <= 0.45
+
+
+def test_compute_metrics_zero_true_positives_and_false_positives():
+    counts = {"tp": 0, "fp": 0, "fn": 3, "tn": 0}
+    result = compute_metrics(counts)
+    assert result == {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+
+# ===== tests/unit/test_nebius_provider.py =====
+"""
+test_nebius_provider.py: tests for NebiusProvider's parsing logic.
+"""
+
+import json
+from providers.nebius_provider import NebiusProvider
+from providers.base import PromptRequest
+
+
+def test_parse_batch_line():
+    fake_line = json.dumps(
+        {
+            "custom_id": "test_id_1",
+            "response": {
+                "body": {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": '{"verdicts": []}',
+                            }
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 20},
+                }
+            },
+        }
+    )
+
+    provider = NebiusProvider(api_key="fake-key-not-used")
+    result = provider._parse_batch_line(fake_line)
+
+    assert result.content == '{"verdicts": []}'
+    assert result.input_tokens == 100
+    assert result.output_tokens == 20
+
+
+def test_build_batch_line_with_image():
+    provider = NebiusProvider(api_key="fake-key-not-used")
+    provider._encoded_images["fake_image.png"] = "fakebase64content"
+
+    request = PromptRequest(
+        custom_id="q1",
+        prompt="test prompt",
+        image_path="fake_image.png",
+        endpoint="test-endpoint",
+    )
+    line = provider._build_batch_line(request)
+
+    assert line["custom_id"] == "q1"
+    assert line["url"] == "/v1/chat/completions"
+    content = line["body"]["messages"][0]["content"]
+    assert content[0]["type"] == "text"
+    assert content[1]["type"] == "image_url"
+
+# ===== tests/unit/test_openai_provider.py =====
+"""
+test_openai_provider.py: tests for OpenAIProvider's parsing logic.
+"""
+
+import json
+from providers.openai_provider import OpenAIProvider
+from providers.base import PromptRequest
+
+
+def test_parse_batch_line():
+    fake_line = json.dumps(
+        {
+            "custom_id": "fake_fingerprint_123",
+            "response": {
+                "body": {
+                    "output": [
+                        {"type": "reasoning", "content": []},  # should be skipped
+                        {"type": "message", "content": [{"text": '{"verdicts": []}'}]},
+                    ],
+                    "usage": {"input_tokens": 100, "output_tokens": 20},
+                }
+            },
+        }
+    )
+
+    provider = OpenAIProvider(api_key="fake-key-not-used")
+    result = provider._parse_batch_line(fake_line)
+
+    assert result.content == '{"verdicts": []}'
+    assert result.input_tokens == 100
+    assert result.output_tokens == 20
+
+
+def test_build_batch_line_with_image(tmp_path):
+    provider = OpenAIProvider(api_key="fake-key-not-used")
+
+    image_path = tmp_path / "fake_image.png"
+    image_path.write_bytes(b"fake image bytes")
+
+    request = PromptRequest(
+        custom_id="q1",
+        prompt="test prompt",
+        endpoint="fake-endpoint-123",
+        image_path=str(image_path),
+    )
+    line = provider._build_batch_line(request)
+
+    assert line["custom_id"] == "q1"
+    assert line["method"] == "POST"
+    assert line["url"] == "/v1/responses"
+    assert line["body"]["model"] == "fake-endpoint-123"
+
+    content = line["body"]["input"][0]["content"]
+
+    assert content[0]["type"] == "input_text"
+    assert content[0]["text"] == "test prompt"
+    assert content[1]["type"] == "input_image"
+    assert content[1]["image_url"].startswith("data:image/png;base64,")
+
+
+def test_build_batch_line_without_image():
+    provider = OpenAIProvider(api_key="fake-key-not-used")
+
+    request = PromptRequest(
+        custom_id="q2",
+        prompt="test prompt",
+        endpoint="fake-endpoint-123",
+        image_path=None,
+    )
+    line = provider._build_batch_line(request)
+
+    content = line["body"]["input"][0]["content"]
+
+    assert content[0]["type"] == "input_text"
+    assert content[0]["text"] == "test prompt"
+    assert len(content) == 1
+
+# ===== tests/unit/test_planner.py =====
+"""
+test_planner.py: tests for plan_work.
+"""
+
+from pathlib import Path
+from execution.planner import plan_work
+from execution.cache import Cache
+from execution.unit import build_fingerprint
+from mutations.base import MutationType, Severity
+from prompting.builder import build_prompt, hash_prompt
+from domain.item import Item
+from domain.properties import QualityProperty
+
+
+def make_item(**overrides):
+    defaults = dict(
+        id="q1",
+        question="test",
+        choices=("a", "b"),
+        answer=0,
+        hint="",
+        image="img.png",
+        task="t",
+        grade="g",
+        subject="s",
+        topic="t",
+        category="c",
+        skill="sk",
+        lecture="",
+        solution="",
+        split="train",
+    )
+    defaults.update(overrides)
+    return Item(**defaults)
+
+
+def test_plan_work_generates_all_combinations(tmp_path):
+    item1 = make_item()
+    cache_path = tmp_path / "cache.txt"
+    cache = Cache(cache_path)
+
+    units = plan_work(
+        items=[item1],
+        mutation_types=[MutationType.TECHNICAL_QUALITY],
+        severities=[Severity.OBVIOUS],
+        models=["gpt5.6"],
+        strategies=["split", "combined"],
+        cache=cache,
+        seed=42,
+    )
+
+    assert len(units) == 2
+
+
+def test_plan_work_skips_cached_fingerprints(tmp_path):
+    item1 = make_item()
+    cache_path = tmp_path / "cache.txt"
+    cache = Cache(cache_path)
+
+    prompt_text = build_prompt(item1, [QualityProperty.TECHNICAL_QUALITY])
+    prompt_hash = hash_prompt(prompt_text)
+    fp = build_fingerprint(
+        "q1", "gpt5.6", "technical_quality", "obvious", 42, "split", prompt_hash
+    )
+    cache.mark_done(fp)
+
+    units = plan_work(
+        items=[item1],
+        mutation_types=[MutationType.TECHNICAL_QUALITY],
+        severities=[Severity.OBVIOUS],
+        models=["gpt5.6"],
+        strategies=["split", "combined"],
+        cache=cache,
+        seed=42,
+    )
+
+    assert len(units) == 1
+    assert units[0].strategy == "combined"
+
+# ===== tests/unit/test_pricing.py =====
+"""
+test_pricing.py
+"""
+
+from decimal import Decimal
+from tracking.pricing import calculate_cost
+from config import ModelPricing
+
+
+def test_calculate_cost():
+    pricing = ModelPricing(
+        input_per_million=Decimal("2.5"), output_per_million=Decimal("15.0")
+    )
+    cost = calculate_cost(pricing, input_tokens=1_000_000, output_tokens=1_000_000)
+    assert cost == Decimal("17.5")
+
+# ===== tests/unit/test_properties.py =====
+from domain.properties import QualityProperty, rubric_for
+
+
+def test_six_properties():
+    """
+    The number of properties must be exactly 6
+    """
+    assert len(QualityProperty) == 6
+
+
+def test_properties_have_rubric():
+    """
+    Each property should have a rubric containing a definition and a note.
+    """
+    for prop in QualityProperty:
+        rubric = rubric_for(prop)
+        assert rubric.definition != ""
+        assert rubric.note != ""
+
+# ===== tests/unit/test_runner.py =====
+"""
+test_runner.py: end-to-end test of run_pipeline using a fake provider.
+"""
+
+import json
+from decimal import Decimal
+
+from providers.base import RawResponse, BatchStatus
+from execution.runner import run_pipeline
+from execution.cache import Cache
+from execution.ledger import Ledger
+from tracking.base import NullTracker
+from config import ModelPricing, ModelConfig
+from mutations.base import MutationType, Severity
+from domain.item import Item
+
+
+class FakeProvider:
+    def __init__(self):
+        self.submitted_batches = {}
+
+    def submit_batch(self, requests):
+        batch_id = f"fake_batch_{len(self.submitted_batches)}"
+        self.submitted_batches[batch_id] = requests
+        return batch_id
+
+    def check_batch_status(self, batch_id):
+        return BatchStatus.COMPLETED
+
+    def fetch_batch(self, batch_id):
+        requests = self.submitted_batches[batch_id]
+        fake_content = json.dumps(
+            [{"property": "technical_quality", "passed": True, "reasoning": ""}]
+        )
+        return [
+            RawResponse(
+                custom_id=request.custom_id,
+                content=fake_content,
+                input_tokens=100,
+                output_tokens=20,
+            )
+            for request in requests
+        ]
+
+
+def make_item(image_path: str, **overrides):
+    defaults = dict(
+        id="q1",
+        question="What is 2+2?",
+        choices=("3", "4", "5"),
+        answer=1,
+        hint="",
+        image=image_path,
+        task="t",
+        grade="3",
+        subject="math",
+        topic="arithmetic",
+        category="c",
+        skill="sk",
+        lecture="",
+        solution="",
+        split="train",
+    )
+    defaults.update(overrides)
+    return Item(**defaults)
+
+
+def make_test_image(path):
+    from PIL import Image
+
+    img = Image.new("RGB", (50, 50), color="red")
+    img.save(path)
+
+
+def test_run_pipeline_end_to_end(tmp_path):
+    image_path = tmp_path / "original.png"
+    make_test_image(image_path)
+    item1 = make_item(str(image_path))
+
+    cache = Cache(tmp_path / "cache.txt")
+    ledger = Ledger(tmp_path / "ledger.txt")
+    tracker = NullTracker()
+    provider = FakeProvider()
+
+    model_configs = {
+        "fake-model": ModelConfig(
+            name="fake-model",
+            provider="openai",
+            endpoint="fake-endpoint",
+        )
+    }
+    pricing = {
+        "fake-model": ModelPricing(
+            input_per_million=Decimal("2.5"), output_per_million=Decimal("15.0")
+        )
+    }
+
+    run_pipeline(
+        items=[item1],
+        mutation_types=[MutationType.TECHNICAL_QUALITY],
+        severities=[Severity.OBVIOUS],
+        models=["fake-model"],
+        strategies=["split"],
+        provider=provider,
+        cache=cache,
+        ledger=ledger,
+        tracker=tracker,
+        pricing=pricing,
+        model_configs=model_configs,
+        seed=42,
+        manifest_path=tmp_path / "manifest.json",
+    )
+
+    assert len(cache.completed) == 1
+    assert len(ledger.get_pending()) == 0
+
+
+def test_run_pipeline_skips_completed_work(tmp_path):
+    image_path = tmp_path / "original.png"
+    make_test_image(image_path)
+    item1 = make_item(str(image_path))
+
+    cache = Cache(tmp_path / "cache.txt")
+    ledger = Ledger(tmp_path / "ledger.txt")
+    tracker = NullTracker()
+    provider = FakeProvider()
+
+    model_configs = {
+        "fake-model": ModelConfig(
+            name="fake-model",
+            provider="openai",
+            endpoint="fake-endpoint",
+        )
+    }
+    pricing = {
+        "fake-model": ModelPricing(
+            input_per_million=Decimal("2.5"), output_per_million=Decimal("15.0")
+        )
+    }
+
+    kwargs = dict(
+        items=[item1],
+        mutation_types=[MutationType.TECHNICAL_QUALITY],
+        severities=[Severity.OBVIOUS],
+        models=["fake-model"],
+        strategies=["split"],
+        provider=provider,
+        cache=cache,
+        ledger=ledger,
+        tracker=tracker,
+        pricing=pricing,
+        model_configs=model_configs,
+        seed=42,
+        manifest_path=tmp_path / "manifest.json",
+    )
+
+    run_pipeline(**kwargs)
+    assert len(provider.submitted_batches) == 1
+
+    run_pipeline(**kwargs)
+    assert len(provider.submitted_batches) == 1
+
+
+def test_run_pipeline_separates_models_into_different_batches(tmp_path):
+    image_path = tmp_path / "original.png"
+    make_test_image(image_path)
+    item1 = make_item(str(image_path))
+
+    cache = Cache(tmp_path / "cache.txt")
+    ledger = Ledger(tmp_path / "ledger.txt")
+    tracker = NullTracker()
+    provider = FakeProvider()
+
+    pricing = {
+        "model-a": ModelPricing(
+            input_per_million=Decimal("2.5"), output_per_million=Decimal("15.0")
+        ),
+        "model-b": ModelPricing(
+            input_per_million=Decimal("2.5"), output_per_million=Decimal("15.0")
+        ),
+    }
+    model_configs = {
+        "model-a": ModelConfig(
+            name="model-a", provider="openai", endpoint="endpoint-a"
+        ),
+        "model-b": ModelConfig(
+            name="model-b", provider="openai", endpoint="endpoint-b"
+        ),
+    }
+
+    run_pipeline(
+        items=[item1],
+        mutation_types=[MutationType.TECHNICAL_QUALITY],
+        severities=[Severity.OBVIOUS],
+        models=["model-a", "model-b"],
+        strategies=["split"],
+        provider=provider,
+        cache=cache,
+        ledger=ledger,
+        tracker=tracker,
+        pricing=pricing,
+        model_configs=model_configs,
+        seed=42,
+        manifest_path=tmp_path / "manifest.json",
+    )
+
+    # 1 item x 1 mutation x 1 severity x 2 models x 1 strategy = 2 total units,
+    # but each model must be its own batch -> 2 separate batches submitted
+    assert len(provider.submitted_batches) == 2
+
+# ===== tests/unit/test_sampling.py =====
+"""
+test_sampling.py: tests for stratidied_sample.
+"""
+
+import pandas as pd
+import numpy as np
+from data.sampling import stratified_sample
+
+
+def make_stratified_dataframe(n_rows=100, seed=0):
+    np.random.seed(seed)
+    subjects = np.random.choice(["math", "geography"], size=n_rows, p=[0.7, 0.3])
+    return pd.DataFrame(
+        {
+            "subject": subjects,
+            "question": [f"question {i}" for i in range(n_rows)],
+        }
+    )
+
+
+def test_stratified_sample_preserves_columns():
+    df = make_stratified_dataframe()
+    sample = stratified_sample(df, n=20, stratify_by="subject", seed=42)
+    assert list(sample.columns) == ["subject", "question"]
+
+
+def test_stratified_sample_returns_roughly_requested_size():
+    df = make_stratified_dataframe()
+    sample = stratified_sample(df, n=20, stratify_by="subject", seed=42)
+    # rounding per group means exact size isn't guaranteed, but should be close
+    assert 15 <= len(sample) <= 25
+
+
+def test_stratified_sample_is_reproducible():
+    df = make_stratified_dataframe()
+    sample_1 = stratified_sample(df, n=20, stratify_by="subject", seed=42)
+    sample_2 = stratified_sample(df, n=20, stratify_by="subject", seed=42)
+    assert sample_1.equals(sample_2)
+
+# ===== tests/unit/test_schema.py =====
+"""
+test_schema.py: tests for VerdictResponse.
+"""
+
+import pytest
+from prompting.schema import VerdictResponse
+from domain.verdict import Verdict
+from domain.properties import QualityProperty
+
+
+def make_verdict(property: QualityProperty.VISUAL_CLARITY, passed=True, reasoning=""):
+    return Verdict(property=property, passed=passed, reasoning=reasoning)
+
+
+def test_valid_response_builds():
+    response = VerdictResponse(
+        verdicts=[make_verdict(property=QualityProperty.VISUAL_CLARITY)]
+    )
+    assert len(response.verdicts) == 1
+
+
+def test_multiple_different_properties_builds():
+    response = VerdictResponse(
+        verdicts=[
+            make_verdict(property=QualityProperty.VISUAL_CLARITY),
+            make_verdict(property=QualityProperty.TECHNICAL_QUALITY),
+        ]
+    )
+    assert len(response.verdicts) == 2
+
+
+def test_duplicate_property_raises():
+    with pytest.raises(ValueError):
+        VerdictResponse(
+            verdicts=[
+                make_verdict(property=QualityProperty.VISUAL_CLARITY),
+                make_verdict(property=QualityProperty.VISUAL_CLARITY),
+            ]
+        )
+
+# ===== tests/unit/test_scienceqa.py =====
+"""
+test_scienceqa.py: Constructs tets to check whether the ScienceQA dataset is properly loaded.
+"""
+
+import pandas as pd
+import pytest
+from data.scienceqa import ScienceQALoader
+from domain.item import Item
+from domain.errors import ItemError
+
+
+# good data
+def make_dataframe(**overrides):
+    """
+    Builds a small, valid ScienceQA-style DataFrame (2 rows),
+    overriding specific columns for testing edge cases.
+    """
+    data = {
+        "question_id": ["q1", "q2"],
+        "question": ["What is 2+2?", "What is the capital of France?"],
+        "choices": ["['3', '4', '5']", "['Paris', 'London', 'Berlin']"],
+        "answer": [1, 0],
+        "hint": ["", ""],
+        "image": ["img1.png", "img2.png"],
+        "task": ["math", "geography"],
+        "grade": ["3", "5"],
+        "subject": ["math", "geography"],
+        "topic": ["arithmetic", "capitals"],
+        "category": ["addition", "europe"],
+        "skill": ["basic-math", "geography-facts"],
+        "lecture": ["", ""],
+        "solution": ["", ""],
+        "set": ["train", "train"],
+    }
+    data.update(overrides)
+    return pd.DataFrame.from_dict(data)
+
+
+def test_load_items_builds_valid_items():
+    """
+    Tests whether items are built correctly.
+    """
+    df = make_dataframe()
+    loader = ScienceQALoader(df)
+    items = loader.load_items()
+
+    assert len(items) == 2
+    for item in items:
+        assert isinstance(item, Item)
+
+    assert items[0].question == "What is 2+2?"
+    assert items[0].choices == ("3", "4", "5")
+    assert items[0].answer == 1
+
+
+def test_loader_name():
+    """
+    Tests if the name of the dataset is loaded correctly.
+    """
+    df = make_dataframe()
+    loader = ScienceQALoader(df)
+    assert loader.name() == "scienceqa"
+
+
+def test_load_items_handles_missing_hint_lecture_solution():
+    """
+    Tests if possible missing values in the 'hint', 'lecture', and 'solution' rows of the dataset are handled correctly.
+    """
+    df = make_dataframe(
+        hint=[float("nan"), 0],
+        lecture=[123, float("nan")],
+        solution=[float("nan"), "a real solution"],
+    )
+
+    loader = ScienceQALoader(df)
+    items = loader.load_items()
+
+    assert items[0].hint == ""
+    assert items[0].lecture == ""
+    assert items[0].solution == ""
+
+    assert items[1].hint == ""
+    assert items[1].lecture == ""
+    assert items[1].solution == "a real solution"
+
+# ===== tests/unit/test_standard_presentation.py =====
+"""
+test_standard_presentation.py: tests for RotateMutation.
+"""
+
+import pytest
+from PIL import Image
+from pathlib import Path
+
+from mutations.standard_presentation import RotateMutation
+from mutations.base import Severity, MutationType
+from domain.item import Item
+
+
+def make_item(image_path: str, item_id: str, **overrides):
+    defaults = dict(
+        id=item_id,
+        question="Q",
+        choices=("a", "b"),
+        answer=0,
+        hint="",
+        image=image_path,
+        task="t",
+        grade="g",
+        subject="s",
+        topic="t",
+        category="c",
+        skill="sk",
+        lecture="",
+        solution="",
+        split="train",
+    )
+    defaults.update(overrides)
+    return Item(**defaults)
+
+
+def make_test_image(path: Path) -> None:
+    img = Image.new("RGB", (50, 50), color="red")
+    img.save(path)
+
+
+def test_rotate_produces_valid_mutated_item(tmp_path):
+    image_path = tmp_path / "original.png"
+    make_test_image(image_path)
+
+    item = make_item(str(image_path), item_id="sp_prod_1")
+    mutation = RotateMutation()
+    result = mutation.apply(item, Severity.OBVIOUS, seed=42)
+
+    assert result.mutation_type == MutationType.STANDARD_PRESENTATION
+    assert result.severity == Severity.OBVIOUS
+    assert Path(result.mutated_image).exists()
+
+
+def test_rotate_severity_produces_different_files(tmp_path):
+    image_path = tmp_path / "original.png"
+    make_test_image(image_path)
+
+    item = make_item(str(image_path), item_id="sp_sev_1")
+    mutation = RotateMutation()
+
+    subtle_result = mutation.apply(item, Severity.SUBTLE, seed=42)
+    obvious_result = mutation.apply(item, Severity.OBVIOUS, seed=42)
+
+    assert subtle_result.mutated_image != obvious_result.mutated_image
+
+# ===== tests/unit/test_summary.py =====
+"""
+test_summary.py: tests for summarize_verdicts.
+"""
+
+from tracking.summary import summarize_verdicts
+from domain.verdict import Verdict
+from domain.properties import QualityProperty
+
+
+def make_verdict(passed: bool, property=QualityProperty.TECHNICAL_QUALITY):
+    reasoning = "" if passed else "some reason"
+    return Verdict(property=property, passed=passed, reasoning=reasoning)
+
+
+def test_summarize_mixed_verdicts():
+    verdicts = [make_verdict(True), make_verdict(False), make_verdict(False)]
+    result = summarize_verdicts(verdicts)
+    assert result == {"passed_count": 1, "failed_count": 2}
+
+
+def test_summarize_all_passed():
+    verdicts = [make_verdict(True), make_verdict(True), make_verdict(True)]
+    result = summarize_verdicts(verdicts)
+    assert result == {"passed_count": 3, "failed_count": 0}
+
+
+def test_summarize_empty_list():
+    verdicts = []
+    result = summarize_verdicts(verdicts)
+    assert result == {"passed_count": 0, "failed_count": 0}
+
+# ===== tests/unit/test_tables.py =====
+"""
+test_tables.py: tests for detection_rate_table_latex and save_table.
+"""
+
+from pathlib import Path
+from evaluation.tables import detection_rate_table_latex, save_table
+
+
+def test_table_contains_all_severities():
+    detection_rates = {
+        "subtle": {"precision": 1.0, "recall": 0.5, "f1": 0.67},
+        "obvious": {"precision": 1.0, "recall": 1.0, "f1": 1.0},
+    }
+    latex = detection_rate_table_latex(detection_rates)
+
+    assert "Subtle" in latex
+    assert "Obvious" in latex
+    assert "0.50" in latex
+    assert "1.00" in latex
+
+
+def test_table_is_valid_latex_structure():
+    detection_rates = {"subtle": {"precision": 1.0, "recall": 0.5, "f1": 0.67}}
+    latex = detection_rate_table_latex(detection_rates)
+
+    assert latex.startswith(r"\begin{table}")
+    assert latex.endswith(r"\end{table}")
+    assert r"\toprule" in latex
+    assert r"\bottomrule" in latex
+
+
+def test_save_table_writes_file(tmp_path):
+    latex = r"\begin{table}test\end{table}"
+    output_path = tmp_path / "test.tex"
+
+    save_table(latex, output_path)
+
+    assert output_path.exists()
+    assert output_path.read_text() == latex
+
+# ===== tests/unit/test_technical_quality.py =====
+"""
+test_technical_quality.py: tests for BlurMutation.
+"""
+
+import pytest
+from PIL import Image
+from pathlib import Path
+
+from mutations.technical_quality import BlurMutation
+from mutations.base import Severity, MutationType
+from domain.item import Item
+
+
+def make_item(image_path: str, **overrides):
+    defaults = dict(
+        id="q1",
+        question="Q",
+        choices=("a", "b"),
+        answer=0,
+        hint="",
+        image=image_path,
+        task="t",
+        grade="g",
+        subject="s",
+        topic="t",
+        category="c",
+        skill="sk",
+        lecture="",
+        solution="",
+        split="train",
+    )
+
+    defaults.update(overrides)
+    return Item(**defaults)
+
+
+def make_test_image(path: Path) -> None:
+    """Creates a small solid-color test image at the given path."""
+    img = Image.new("RGB", (50, 50), color="red")
+    img.save(path)
+
+
+def test_blur_produced_valid_mutated_item(tmp_path):
+    image_path = tmp_path / "original.png"
+    make_test_image(image_path)
+
+    item = make_item(str(image_path))
+    mutation = BlurMutation()
+    result = mutation.apply(item, Severity.OBVIOUS, seed=42)
+
+    assert result.mutation_type == MutationType.TECHNICAL_QUALITY
+    assert result.severity == Severity.OBVIOUS
+    assert Path(result.mutated_image).exists()
+
+
+def test_blue_severity_produces_different_files(tmp_path):
+    image_path = tmp_path / "original.png"
+    make_test_image(image_path)
+
+    item = make_item(str(image_path))
+    mutation = BlurMutation()
+
+    subtle_result = mutation.apply(item, Severity.SUBTLE, seed=42)
+    obvious_result = mutation.apply(item, Severity.OBVIOUS, seed=42)
+
+    assert subtle_result.mutated_image != obvious_result.mutated_image
+
+# ===== tests/unit/test_text_image_coherence.py =====
+"""
+test_text_image_coherence.py: tests for TextImageCoherence.
+"""
+
+import pytest
+from PIL import Image
+from pathlib import Path
+
+from mutations.text_image_coherence import TextImageCoherenceMutation
+from mutations.base import Severity, MutationType
+from domain.item import Item
+
+
+def make_item(image_path: str, item_id: str = "q1", **overrides):
+    defaults = dict(
+        id=item_id,
+        question="Q",
+        choices=("a", "b"),
+        answer=0,
+        hint="",
+        image=image_path,
+        task="t",
+        grade="g",
+        subject="s",
+        topic="t",
+        category="c",
+        skill="sk",
+        lecture="",
+        solution="",
+        split="train",
+    )
+    defaults.update(overrides)
+    return Item(**defaults)
+
+
+def make_test_image(path: Path, color: str) -> None:
+    img = Image.new("RGB", (50, 50), color=color)
+    img.save(path)
+
+
+def test_relevance_produces_valid_mutated_item(tmp_path):
+    image_1_path = tmp_path / "image1.png"
+    make_test_image(image_1_path, "red")
+    item_1 = make_item(str(image_1_path), item_id="tic_prod_1", topic="triangles")
+
+    image_2_path = tmp_path / "image2.png"
+    make_test_image(image_2_path, "blue")
+    item_2 = make_item(str(image_2_path), item_id="tic_prod_2", topic="circles")
+
+    mutation = TextImageCoherenceMutation(candidates=[item_1, item_2])
+    result = mutation.apply(item_1, Severity.OBVIOUS, seed=42)
+
+    assert result.mutation_type == MutationType.TEXT_IMAGE_COHERENCE
+    assert result.severity == Severity.OBVIOUS
+    assert Path(result.mutated_image).exists()
+
+
+def test_relevance_substitutes_with_different_image(tmp_path):
+    image_1_path = tmp_path / "image1.png"
+    make_test_image(image_1_path, "red")
+    item_1 = make_item(str(image_1_path), item_id="tic_sub_1", topic="triangles")
+
+    image_2_path = tmp_path / "image2.png"
+    make_test_image(image_2_path, "blue")
+    item_2 = make_item(str(image_2_path), item_id="tic_sub_2", topic="circles")
+
+    mutation = TextImageCoherenceMutation(candidates=[item_1, item_2])
+    result = mutation.apply(item_1, Severity.OBVIOUS, seed=42)
+
+    mutated_image = Image.open(result.mutated_image).convert("RGB")
+    pixel = mutated_image.getpixel((0, 0))
+    assert pixel == (0, 0, 255)
+
+
+def test_relevance_never_substitutes_with_itself(tmp_path):
+    image_1_path = tmp_path / "image1.png"
+    make_test_image(image_1_path, "red")
+    item_1 = make_item(str(image_1_path), item_id="tic_never_1", topic="triangles")
+
+    image_2_path = tmp_path / "image2.png"
+    make_test_image(image_2_path, "blue")
+    item_2 = make_item(str(image_2_path), item_id="tic_never_2", topic="circles")
+
+    image_3_path = tmp_path / "image3.png"
+    make_test_image(image_3_path, "green")
+    item_3 = make_item(str(image_3_path), item_id="tic_never_3", topic="squares")
+
+    mutation = TextImageCoherenceMutation(candidates=[item_1, item_2, item_3])
+
+    for seed in range(10):
+        result = mutation.apply(item_1, Severity.OBVIOUS, seed=seed)
+        mutated_image = Image.open(result.mutated_image).convert("RGB")
+        pixel = mutated_image.getpixel((0, 0))
+        assert pixel != (255, 0, 0)
+
+# ===== tests/unit/test_unit.py =====
+"""
+test_unit.py: tests for build_fingerprint.
+"""
+
+from execution.unit import build_fingerprint
+
+
+def test_same_inputs_produce_same_fingerprint():
+    fp1 = build_fingerprint(
+        "q1", "gpt5.6", "technical_quality", "obvious", 42, "split", "abc123"
+    )
+    fp2 = build_fingerprint(
+        "q1", "gpt5.6", "technical_quality", "obvious", 42, "split", "abc123"
+    )
+    assert fp1 == fp2
+
+
+def test_different_strategy_produces_different_fingerprint():
+    fp1 = build_fingerprint(
+        "q1", "gpt5.6", "technical_quality", "obvious", 42, "split", "abc123"
+    )
+    fp2 = build_fingerprint(
+        "q1", "gpt5.6", "technical_quality", "obvious", 42, "combined", "abc123"
+    )
+    assert fp1 != fp2
+
+
+def test_different_seed_produces_different_fingerprint():
+    fp1 = build_fingerprint(
+        "q1", "gpt5.6", "technical_quality", "obvious", 42, "split", "abc123"
+    )
+    fp2 = build_fingerprint(
+        "q1", "gpt5.6", "technical_quality", "obvious", 99, "split", "abc123"
+    )
+    assert fp1 != fp2
+
+# ===== tests/unit/test_verdict.py =====
+"""
+test_verdict.py: tests for the Verdict dataclass.
+"""
+
+import pytest
+from domain.verdict import Verdict
+from domain.properties import QualityProperty
+from domain.errors import VerdictError
+from pydantic import ValidationError
+
+
+# builds a valid verdict to be overridden with the data we are testing
+def make_verdict(**overrides):
+    """
+    Builds a valid Verdict, overriding ony the fields being tested.
+    """
+    defaults = dict(
+        property=QualityProperty.VISUAL_CLARITY,
+        passed=True,
+        reasoning="",
+    )
+    defaults.update(overrides)
+    return Verdict(**defaults)
+
+
+# happy path: valid verdict builds
+def test_valid_verdict_builds():
+    """
+    A normal, correct Verdict should build without error.
+    """
+    verdict = make_verdict()
+    assert verdict.property == QualityProperty.VISUAL_CLARITY
+    assert verdict.passed == True
+    assert verdict.reasoning == ""
+
+
+# immutability
+def test_verdict_is_frozen():
+    """
+    Verdicts should not be changed after they have been created. Doing so should raise, not pass silently.
+    """
+    verdict = make_verdict()
+    with pytest.raises(ValidationError):
+        verdict.passed = False
+
+
+# sad path: invalid without explanation
+def test_not_passed_needs_reasoning():
+    """
+    Quality properties that did not pass should always have a reasoninig. Empty strings in the reasoning field should fail.
+    """
+    with pytest.raises(VerdictError):
+        make_verdict(passed=False, reasoning="")
+
+
+def test_passed_has_no_reasoning():
+    """
+    Quality properties that pass should have empty strings as reasoning. Any other data in that field should raise.
+    """
+    with pytest.raises(VerdictError):
+        make_verdict(passed=True, reasoning="The trait passed successfully.")
+
+# ===== tests/unit/test_visual_clarity.py =====
+"""
+test_visual_clarity.py: tests for ClarityMutation.
+"""
+
+import pytest
+from PIL import Image
+from pathlib import Path
+
+from mutations.visual_clarity import ClarityMutation
+from mutations.base import Severity, MutationType
+from domain.item import Item
+
+
+def make_item(image_path: str, item_id: str, **overrides):
+    defaults = dict(
+        id=item_id,
+        question="Q",
+        choices=("a", "b"),
+        answer=0,
+        hint="",
+        image=image_path,
+        task="t",
+        grade="g",
+        subject="s",
+        topic="t",
+        category="c",
+        skill="sk",
+        lecture="",
+        solution="",
+        split="train",
+    )
+    defaults.update(overrides)
+    return Item(**defaults)
+
+
+def make_test_image(path: Path) -> None:
+    img = Image.new("RGB", (50, 50), color="red")
+    img.save(path)
+
+
+def test_clarity_produces_valid_mutated_item(tmp_path):
+    image_path = tmp_path / "original.png"
+    make_test_image(image_path)
+
+    item = make_item(str(image_path), item_id="cl_prod_1")
+    mutation = ClarityMutation()
+    result = mutation.apply(item, Severity.OBVIOUS, seed=42)
+
+    assert result.mutation_type == MutationType.VISUAL_CLARITY
+    assert result.severity == Severity.OBVIOUS
+    assert Path(result.mutated_image).exists()
+
+
+def test_clarity_severity_produces_different_files(tmp_path):
+    image_path = tmp_path / "original.png"
+    make_test_image(image_path)
+
+    item = make_item(str(image_path), item_id="cl_sev_1")
+    mutation = ClarityMutation()
+
+    subtle_result = mutation.apply(item, Severity.SUBTLE, seed=42)
+    obvious_result = mutation.apply(item, Severity.OBVIOUS, seed=42)
+
+    assert subtle_result.mutated_image != obvious_result.mutated_image
+
+# ===== tracking/base.py =====
+"""
+base.py: defines the Tracker protocol every tracking backend must implement,
+and NullTracker, the default no-op implementation.
+"""
+
+from typing import Protocol
+
+
+class Tracker(Protocol):
+    def log_run_start(self, params: dict) -> None: ...
+
+    def log_metrics(self, metrics: dict) -> None: ...
+
+    def log_run_end(self) -> None: ...
+
+
+class NullTracker:
+    def __init__(self): ...
+
+    def log_run_start(self, params: dict) -> None:
+        pass
+
+    def log_metrics(self, metrics: dict) -> None:
+        pass
+
+    def log_run_end(self) -> None:
+        pass
+
+# ===== tracking/mlflow_tracker.py =====
+"""
+mlflow_tracker.py: MLflow implementation of the Tracker protocol.
+"""
+
+import mlflow
+
+
+class MLflowTracker:
+    def __init__(self):
+        self.active_run = None
+
+    def log_run_start(self, params: dict) -> None:
+        mlflow.start_run()
+        mlflow.log_params(params)
+
+    def log_metrics(self, metrics: dict) -> None:
+        mlflow.log_metrics(metrics)
+
+    def log_run_end(self) -> None:
+        mlflow.end_run()
+
+# ===== tracking/pricing.py =====
+"""
+pricing.py: cost calculation from token usage, using Decimal for precision.
+"""
+
+from decimal import Decimal
+from config import ModelPricing
+
+
+def calculate_cost(
+    pricing: ModelPricing, input_tokens: int, output_tokens: int
+) -> Decimal:
+    """
+    Computes the cost of one API call, given per-million-token pricing
+    and actual token counts.
+    """
+    input_cost = (pricing.input_per_million * input_tokens) / 1_000_000
+    output_cost = (pricing.output_per_million * output_tokens) / 1_000_000
+
+    return input_cost + output_cost
+
+# ===== tracking/registry.py =====
+"""
+registry.py: maps tracker names to their classes.
+"""
+
+from tracking.base import Tracker, NullTracker
+from tracking.mlflow_tracker import MLflowTracker
+
+TRACKERS: dict[str, type] = {"mlflow": MLflowTracker, "null": NullTracker}
+
+
+def get_tracker(name: str, *args, **kwargs) -> Tracker:
+    if name not in TRACKERS:
+        raise ValueError(f"Unknown tracker: {name}")
+    tracker_class = TRACKERS[name]
+    return tracker_class(*args, **kwargs)
+
+# ===== tracking/summary.py =====
+"""
+summary.py: aggregates Verdicts into summary metrics for tracking/logging.
+"""
+
+from domain.verdict import Verdict
+
+
+def summarize_verdicts(verdicts: list[Verdict]) -> dict:
+    """
+    Summarizes a list of Verdicts into pass/fail counts, for logging.
+    """
+    passed_count = sum(v.passed for v in verdicts)
+    failed_count = len(verdicts) - passed_count
+
+    return {
+        "passed_count": passed_count,
+        "failed_count": failed_count,
+    }
+
